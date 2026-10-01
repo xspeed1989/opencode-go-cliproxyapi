@@ -34,19 +34,22 @@ func TestConvertNonStreamStatusErrors(t *testing.T) {
 		}
 	}
 
-	// Long bodies are bounded to a redacted snippet, never echoed whole.
-	_, eErr := ConvertNonStreamResponse("claude", 500, []byte(`{"error":"`+strings.Repeat("y", 200)+`"}`))
-	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 83 {
+	// Long bodies are reported as a bounded snippet, never echoed whole.
+	tail := strings.Repeat("y", 4096)
+	_, eErr := ConvertNonStreamResponse("claude", 500, []byte(`{"error":"`+tail+`"}`))
+	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || strings.Contains(eErr.Message, tail) {
 		t.Fatalf("upstream body not bounded: %q", eErr.Message)
 	}
 }
 
-func TestConvertNonStreamRedactsSecrets(t *testing.T) {
+func TestConvertNonStreamReportsUpstreamError(t *testing.T) {
 	_, eErr := ConvertNonStreamResponse("claude", 401,
 		[]byte(`{"error":"bad key Bearer sk-secret-123 refused"}`))
 	wantErr(t, eErr, errclass.ClassAuth)
-	if strings.Contains(eErr.Message, "sk-secret-123") || !strings.Contains(eErr.Message, "[redacted]") {
-		t.Fatalf("secret leaked: %q", eErr.Message)
+	// Redaction was removed by operator decision (v0.1.13): the upstream text is
+	// reported verbatim so the failure is diagnosable.
+	if !strings.Contains(eErr.Message, "sk-secret-123") {
+		t.Fatalf("upstream text missing: %q", eErr.Message)
 	}
 }
 

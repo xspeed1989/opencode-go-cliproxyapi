@@ -844,7 +844,7 @@ func TestExecuteStream4xxBodySnippetIsBounded(t *testing.T) {
 	if env.OK || env.Error == nil {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
-	if len(env.Error.Message) > 200 {
+	if len(env.Error.Message) > shared.ErrorSnippetLimit+3 {
 		t.Fatalf("message not bounded: %d chars", len(env.Error.Message))
 	}
 }
@@ -1398,11 +1398,11 @@ func TestConvertNonStreamSeamBranches(t *testing.T) {
 		eErr.Class != errclass.ClassTranslation {
 		t.Fatalf("malformed passthrough = %v", eErr)
 	}
-	long := strings.Repeat("x", 300)
-	if got := shared.RedactedSnippet(long); got != long[:80]+"..." {
+	long := strings.Repeat("x", shared.ErrorSnippetLimit+100)
+	if got := shared.ErrorSnippet(long); got != long[:shared.ErrorSnippetLimit]+"..." {
 		t.Fatalf("snippet truncation = %d chars", len(got))
 	}
-	if got := shared.RedactedSnippet("short"); got != "short" {
+	if got := shared.ErrorSnippet("short"); got != "short" {
 		t.Fatalf("short snippet = %q", got)
 	}
 }

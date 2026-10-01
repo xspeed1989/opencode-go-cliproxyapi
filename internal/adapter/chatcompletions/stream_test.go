@@ -456,14 +456,16 @@ func TestStreamConverterClaudeVariants(t *testing.T) {
 			t.Fatalf("comment lines must be ignored: %v %v", evs, eErr)
 		}
 	})
-	t.Run("malformed chunk errors with short snippet", func(t *testing.T) {
+	t.Run("malformed chunk reports a bounded snippet", func(t *testing.T) {
 		sc := NewStreamConverter("claude")
-		payload := `{"choices":[{"delta":{"content":"` + strings.Repeat("x", 200)
+		tail := strings.Repeat("x", 4096)
+		payload := `{"choices":[{"delta":{"content":"` + tail
 		_, _, eErr := sc.Feed([]byte("data: " + payload + "\n"))
 		if eErr == nil || eErr.Class != errclass.ClassTranslation {
 			t.Fatalf("want ClassTranslation, got %+v", eErr)
 		}
-		if len(eErr.Message) > 160 || strings.Contains(eErr.Message, payload[100:]) {
+		// The payload is reported as a bounded snippet, never echoed whole.
+		if !strings.HasSuffix(eErr.Message, "...") || strings.Contains(eErr.Message, tail) {
 			t.Fatalf("error echoes too much upstream body: %q", eErr.Message)
 		}
 	})
@@ -731,18 +733,17 @@ func TestStreamConverterTerminalReasonToolsOutrankLength(t *testing.T) {
 
 // Malformed-chunk errors redact bearer tokens from the echoed snippet and
 // stay bounded (§5 security: never an upstream body echo).
-func TestStreamConverterMalformedChunkRedactsBearer(t *testing.T) {
+func TestStreamConverterMalformedChunkReportsUpstreamSnippet(t *testing.T) {
 	sc := NewStreamConverter("claude")
 	payload := `{"garbage":"prefix Bearer sk-secret123-token suffix ` + strings.Repeat("y", 200) + `"`
 	_, _, eErr := sc.Feed([]byte("data: " + payload + "\n"))
 	if eErr == nil || eErr.Class != errclass.ClassTranslation {
 		t.Fatalf("want ClassTranslation, got %+v", eErr)
 	}
-	if strings.Contains(eErr.Message, "sk-secret123") {
-		t.Fatalf("error leaks bearer token: %q", eErr.Message)
-	}
-	if len(eErr.Message) > 160 {
-		t.Fatalf("error not bounded: %d chars", len(eErr.Message))
+	// Redaction was removed by operator decision (v0.1.13): the upstream text is
+	// reported verbatim so the failure is diagnosable.
+	if !strings.Contains(eErr.Message, "sk-secret123-token") {
+		t.Fatalf("upstream snippet missing: %q", eErr.Message)
 	}
 }
 

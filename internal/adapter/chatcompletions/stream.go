@@ -224,7 +224,7 @@ type ccChunkError struct {
 func (sc *StreamConverter) decodeChunk(data string) (*ccChunk, *errclass.Error) {
 	var chunk ccChunk
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-		return nil, errclass.Translation("malformed Chat Completions stream chunk: " + shared.RedactedSnippet(data))
+		return nil, errclass.Translation("malformed Chat Completions stream chunk: " + shared.ErrorSnippet(data))
 	}
 	if chunk.Error != nil {
 		return nil, chunkError(chunk.Error)

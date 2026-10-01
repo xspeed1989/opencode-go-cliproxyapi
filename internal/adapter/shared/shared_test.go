@@ -301,17 +301,19 @@ func TestClaudeEventEmitterFrameShapes(t *testing.T) {
 	}
 }
 
-func TestRedactedSnippet(t *testing.T) {
-	if got := RedactedSnippet("Bearer sk-secret-123 rest"); got != "Bearer [redacted] rest" {
-		t.Fatalf("redaction = %q", got)
+func TestErrorSnippet(t *testing.T) {
+	// Redaction was removed by operator decision (v0.1.13): the upstream text is
+	// reported verbatim so a failure is diagnosable.
+	if got := ErrorSnippet("Bearer sk-secret-123 rest"); got != "Bearer sk-secret-123 rest" {
+		t.Fatalf("verbatim = %q", got)
 	}
-	long := strings.Repeat("a", 100)
-	got := RedactedSnippet(long)
-	if got != long[:80]+"..." {
+	long := strings.Repeat("a", ErrorSnippetLimit+100)
+	got := ErrorSnippet(long)
+	if got != long[:ErrorSnippetLimit]+"..." {
 		t.Fatalf("truncation = %d chars, tail %q", len(got), got[len(got)-4:])
 	}
 	short := "plain text"
-	if got := RedactedSnippet(short); got != short {
+	if got := ErrorSnippet(short); got != short {
 		t.Fatalf("short string changed: %q", got)
 	}
 }
@@ -321,20 +323,23 @@ func TestUpstreamStatusError(t *testing.T) {
 	if e.Class != errclass.ClassQuota || e.StatusCode != 429 {
 		t.Fatalf("classification = %+v", e)
 	}
-	if strings.Contains(e.Message, "sk-secret-123") || !strings.Contains(e.Message, "[redacted]") {
-		t.Fatalf("secret leaked: %q", e.Message)
+	// Messages are reported verbatim, so the upstream text is diagnosable.
+	if !strings.Contains(e.Message, "Bearer sk-secret-123") {
+		t.Fatalf("upstream text missing: %q", e.Message)
 	}
 
-	// Oversized bodies are truncated before snippet extraction, so the
-	// message stays snippet-sized regardless of body size.
-	for _, size := range []int{100, 4096, 4097, 1 << 20} {
+	// Oversized bodies are reported as a bounded snippet, never echoed whole.
+	for _, size := range []int{100, ErrorSnippetLimit, ErrorSnippetLimit + 1, 1 << 20} {
 		e = UpstreamStatusError(500, []byte(strings.Repeat("x", size)))
-		if len(e.Message) > 83 || !strings.HasSuffix(e.Message, "...") {
+		if len(e.Message) > ErrorSnippetLimit+3 || strings.Contains(e.Message, strings.Repeat("x", ErrorSnippetLimit+1)) {
 			t.Fatalf("size %d not bounded: %d chars", size, len(e.Message))
+		}
+		if size > ErrorSnippetLimit && !strings.HasSuffix(e.Message, "...") {
+			t.Fatalf("size %d missing truncation marker: %q", size, e.Message)
 		}
 	}
 
-	// Short bodies pass through as the whole redacted snippet.
+	// Short bodies pass through as the whole snippet.
 	if e := UpstreamStatusError(503, []byte("down")); e.Message != "down" {
 		t.Fatalf("short body = %q", e.Message)
 	}

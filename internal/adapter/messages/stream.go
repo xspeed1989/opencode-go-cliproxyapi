@@ -97,7 +97,7 @@ func (sc *StreamConverter) dispatch(etype, data string, rawBlock []byte, events 
 	var ev sseEvent
 	if data != "" {
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			return false, errclass.Translation(fmt.Sprintf("malformed SSE data JSON: %s", shared.RedactedSnippet(data)))
+			return false, errclass.Translation(fmt.Sprintf("malformed SSE data JSON: %s", shared.ErrorSnippet(data)))
 		}
 		if etype == "" {
 			etype = ev.Type // tolerate missing event: line

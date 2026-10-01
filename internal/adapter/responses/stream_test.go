@@ -836,7 +836,7 @@ func TestCRLFStreamTolerated(t *testing.T) {
 }
 
 func TestMalformedPayloadTranslationError(t *testing.T) {
-	longBad := `{"delta":"` + strings.Repeat("x", 100)
+	longBad := `{"delta":"` + strings.Repeat("x", 4096)
 	sc := NewStreamConverter("openai")
 	events, _, eErr := feedChunks(t, sc, []string{
 		frame("response.created", createdPayload),
@@ -851,8 +851,8 @@ func TestMalformedPayloadTranslationError(t *testing.T) {
 	if !strings.Contains(eErr.Message, "malformed response.output_text.delta event payload") {
 		t.Errorf("message = %q", eErr.Message)
 	}
-	if !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 200 {
-		t.Errorf("snippet not truncated/redacted: %q", eErr.Message)
+	if !strings.HasSuffix(eErr.Message, "...") || strings.Contains(eErr.Message, strings.Repeat("x", 4096)) {
+		t.Errorf("snippet not bounded: %q", eErr.Message)
 	}
 	short, _, eErr := runStream(t, "openai", frame("response.output_text.delta", `{bad`))
 	if eErr == nil || !strings.HasSuffix(eErr.Message, "{bad") {

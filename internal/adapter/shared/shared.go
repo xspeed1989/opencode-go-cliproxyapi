@@ -712,31 +712,27 @@ func (e ResponsesEventEmitter) Completed(status string, usage ResponsesUsage, ou
 	})
 }
 
-// RedactedSnippet bearer-redacts and truncates a payload snippet for error
-// messages — never an upstream body echo (FR-011).
-func RedactedSnippet(s string) string {
-	s = errclass.Redact(s)
-	if len(s) > 80 {
-		return s[:80] + "..."
+// ErrorSnippetLimit bounds how much of an upstream payload is reported inside
+// an error message. Redaction was removed by operator decision (v0.1.13) so an
+// upstream reason is diagnosable; an upstream body that echoes credentials is
+// therefore echoed too.
+const ErrorSnippetLimit = 2048
+
+// ErrorSnippet returns the head of an upstream payload for an error message:
+// verbatim up to ErrorSnippetLimit, then marked as truncated.
+func ErrorSnippet(s string) string {
+	if len(s) > ErrorSnippetLimit {
+		return s[:ErrorSnippetLimit] + "..."
 	}
 	return s
 }
 
-// snippetBound bounds redaction work: only the head of an oversized error
-// body can reach the 80-char snippet, so every upstream >=400 site
-// truncates to this size before scanning (FR-011).
-const snippetBound = 4096
-
 // UpstreamStatusError classifies an upstream >=400 response body into one
-// kernel used by every adapter and the executor: the body is truncated to
-// its head before redacted-snippet extraction, then classified per §7 via
-// errclass.FromStatus. One kernel keeps bounding and redaction from
-// diverging across call sites.
+// kernel used by every adapter and the executor: the body head is reported
+// verbatim (bounded by ErrorSnippet) and classified per §7 via
+// errclass.FromStatus. One kernel keeps bounding from diverging across sites.
 func UpstreamStatusError(status int, body []byte) *errclass.Error {
-	if len(body) > snippetBound {
-		body = body[:snippetBound]
-	}
-	return errclass.FromStatus(status, RedactedSnippet(string(body)))
+	return errclass.FromStatus(status, ErrorSnippet(string(body)))
 }
 
 // ResponsesUsage is the token-usage block of synthesized Responses

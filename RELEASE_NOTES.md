@@ -1,15 +1,18 @@
 ## What's Changed
 
-### Bug Fixes
+### Changes
 
-- Report the upstream reason when a streaming request is refused. A refusal with HTTP >= 400 before the first byte used to produce an error envelope with an empty message, which CLIProxyAPI renders as its generic `plugin call failed` (HTTP 400). That hid both the status and the upstream explanation, because `debugTrace` is compiled out of release builds. The stream open-failure path now reads a bounded prefix of the refused response body and classifies with that snippet, so the real cause is visible.
-- Guarantee that every classified error carries a message. An empty message is replaced by a class-derived fallback naming the failure class and, when known, the upstream status (for example `upstream returned HTTP 400 (unsupported_protocol_or_parameter) without a message`). The guarantee applies in the constructors and again at the envelope edge, which also covers in-stream upstream failures that arrive without a message.
-- Keep the added read bounded and safe: at most 8 KiB across at most 8 host reads per refused stream, and the snippet stays redacted and truncated, so an oversized upstream error body is never echoed back in full.
+- Remove error-message redaction. Error text now reaches the client verbatim, and an upstream error body is reported up to 2 KiB instead of an 80-character snippet. This is a deliberate operator decision: the previous redaction made upstream refusals undiagnosable, and the host renders an empty message as its generic `plugin call failed` placeholder.
+- Applies everywhere messages are produced: adapter translation failures, upstream status classification, in-stream upstream errors, the stream pump close reasons, and the envelope edge. The 2 KiB bound is shared (`shared.ErrorSnippetLimit`), so an oversized body is still reported as a head plus a truncation marker rather than echoed whole.
+
+### Security notice
+
+- **Error output is no longer scrubbed.** A credential that an upstream, transport failure, or malformed payload echoes in its error text will now surface in the client-visible error message and in any log that records it. Treat client-visible errors and CPA logs as sensitive. Nothing else about the error path changed; only redaction was removed and the snippet bound widened.
 
 ## Upgrade Notes
 
 - Replace the old plugin binary with the new release binary, or update from this fork's plugin-store source.
 - Reload or restart CLIProxyAPI as your deployment requires.
-- A failed streaming request now surfaces the upstream status and a redacted snippet of its error body instead of `plugin call failed`. No new configuration switch, and no other behaviour changes.
+- If you need redaction restored, do not deploy this release: it is a deliberate behaviour change, not a regression.
 
-**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.11...v0.1.12
+**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.12...v0.1.13

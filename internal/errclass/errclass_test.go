@@ -152,9 +152,9 @@ func TestUpstreamFallback(t *testing.T) {
 	if e.StatusCode != 0 {
 		t.Errorf("StatusCode = %+v", e)
 	}
-	want := "upstream stream broke: Bearer [redacted] mid-chunk"
+	want := "upstream stream broke: Bearer sk-secret99 mid-chunk"
 	if e.Message != want {
-		t.Errorf("Message = %q, want redacted %q", e.Message, want)
+		t.Errorf("Message = %q, want verbatim %q", e.Message, want)
 	}
 }
 
@@ -169,16 +169,16 @@ func TestPostFirstByteNetwork(t *testing.T) {
 	if e.StatusCode != 0 {
 		t.Errorf("StatusCode = %+v", e)
 	}
-	want := "stream read after first byte: Bearer [redacted] dropped"
+	want := "stream read after first byte: Bearer sk-secret99 dropped"
 	if e.Message != want {
-		t.Errorf("Message = %q, want redacted %q", e.Message, want)
+		t.Errorf("Message = %q, want verbatim %q", e.Message, want)
 	}
 }
 
 func TestToEnvelopeError(t *testing.T) {
 	in := &Error{Class: ClassAuth, Message: "Bearer sk-secret failed", StatusCode: 401}
 	got := ToEnvelopeError(in)
-	want := pluginabi.Error{Code: "auth_failure", Message: "Bearer [redacted] failed", Retryable: false, HTTPStatus: 401}
+	want := pluginabi.Error{Code: "auth_failure", Message: "Bearer sk-secret failed", Retryable: false, HTTPStatus: 401}
 	if got != want {
 		t.Errorf("ToEnvelopeError = %+v, want %+v", got, want)
 	}
@@ -211,75 +211,29 @@ func TestToEnvelopeError(t *testing.T) {
 	}
 }
 
-func TestRedact(t *testing.T) {
-	tests := []struct{ in, want string }{
-		{"plain failure", "plain failure"},
-		{"Authorization: Bearer abc123 bad", "Authorization: Bearer [redacted] bad"},
-		{"bearer lower-case tok!", "Bearer [redacted] tok!"},
-		{"two: Bearer a1 and Bearer b2 end", "two: Bearer [redacted] and Bearer [redacted] end"},
-		{"trailing token Bearer z9", "trailing token Bearer [redacted]"},
-		{"list Bearer t1,x \"Bearer t2\"", "list Bearer [redacted],x \"Bearer [redacted]\""},
-		{"lone word bearer", "lone word Bearer [redacted]"},
-		{"tabbed\tBearer\ttok\tend", "tabbed\tBearer [redacted]\tend"},
+// Redaction was removed by operator decision (v0.1.13): a message reaches the
+// envelope verbatim so an upstream reason is diagnosable. This pins the new
+// policy, including the credential-shaped inputs the old scanner rewrote.
+func TestMessagesAreReportedVerbatim(t *testing.T) {
+	unchanged := []string{
+		"plain failure",
+		"Authorization: Bearer abc123 bad",
+		"bearer lower-case tok!",
+		"two: Bearer a1 and Bearer b2 end",
+		"upstream said x-api-key: sk-ant-api03-9f2Kx7QwLp end",
+		`{"error":{"message":"invalid x-api-key sk-live-ab12cd34ef"}}`,
+		`Get "https://gw.example/v1?api_key=SECRET9key": dial tcp 1.2.3.4:443`,
+		"https://gw.example/v1?api_key=S3cret&model=gpt&token=tok999 still here",
 	}
-	for _, tc := range tests {
-		if got := Redact(tc.in); got != tc.want {
-			t.Errorf("Redact(%q) = %q, want %q", tc.in, got, tc.want)
+	for _, in := range unchanged {
+		if got := FromStatus(http.StatusBadRequest, in).Message; got != in {
+			t.Errorf("FromStatus message = %q, want verbatim %q", got, in)
 		}
-	}
-}
-
-func TestRedactAPIKeyEchoes(t *testing.T) {
-	tests := []struct{ in, want string }{
-		// Header echo forms: colon, JSON quotes, equals, bare space.
-		{"upstream said x-api-key: sk-ant-api03-9f2Kx7QwLp end", "upstream said x-api-key: [redacted] end"},
-		{`{"error":{"message":"invalid x-api-key sk-live-ab12cd34ef"}}`, `{"error":{"message":"invalid x-api-key [redacted]"}}`},
-		{"auth failed x-api-key=AKIA1234ABCD5678 retry", "auth failed x-api-key=[redacted] retry"},
-		{"echo X-API-Key sk-test-1234567890 done", "echo X-API-Key [redacted] done"},
-		// Base64 alphabet (+, /, =) values are covered by the value class.
-		{"echo x-api-key: aGVsbG8rd29ybGQ9 end", "echo x-api-key: [redacted] end"},
-		{"auth x-api-key=Ab12Cd34+/EFghIjKl== retry", "auth x-api-key=[redacted] retry"},
-		// Prose after the header name must not be mangled.
-		{"missing x-api-key authentication header", "missing x-api-key authentication header"},
-		{"the x-api-key header is required", "the x-api-key header is required"},
-		{"x-api-key: request rejected by policy", "x-api-key: request rejected by policy"},
-		// Too short to be a key.
-		{"x-api-key: abc123 next", "x-api-key: abc123 next"},
-		// Bearer behavior unchanged alongside the new pattern.
-		{"Bearer tok1 then x-api-key: sk-99887766aabb end", "Bearer [redacted] then x-api-key: [redacted] end"},
-	}
-	for _, tc := range tests {
-		got := Redact(tc.in)
-		if got != tc.want {
-			t.Errorf("Redact(%q) = %q, want %q", tc.in, got, tc.want)
+		if got := UpstreamFallback(in).Message; got != in {
+			t.Errorf("UpstreamFallback message = %q, want verbatim %q", got, in)
 		}
-		if again := Redact(got); again != got {
-			t.Errorf("Redact not idempotent on %q: %q", got, again)
-		}
-	}
-}
-
-func TestRedactQueryKeys(t *testing.T) {
-	tests := []struct{ in, want string }{
-		// Transport-failure URL echo with a query-carried key.
-		{`Get "https://gw.example/v1?api_key=SECRET9key": dial tcp 1.2.3.4:443`, `Get "https://gw.example/v1?api_key=[redacted]": dial tcp 1.2.3.4:443`},
-		// Parameter name kept (all alias spellings), value redacted.
-		{"bad url ?key=v9alue trailing", "bad url ?key=[redacted] trailing"},
-		{"fail ?access_token=abc123def456 end", "fail ?access_token=[redacted] end"},
-		{"hyphen url ?api-key=zzz999yyy888 done", "hyphen url ?api-key=[redacted] done"},
-		// Consecutive params survive; only keyed values redacted.
-		{"https://gw.example/v1?api_key=S3cret&model=gpt&token=tok999 still here",
-			"https://gw.example/v1?api_key=[redacted]&model=gpt&token=[redacted] still here"},
-		// Unrelated params untouched.
-		{"https://gw.example/v1?page=2&q=quota+limit", "https://gw.example/v1?page=2&q=quota+limit"},
-	}
-	for _, tc := range tests {
-		got := Redact(tc.in)
-		if got != tc.want {
-			t.Errorf("Redact(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-		if again := Redact(got); again != got {
-			t.Errorf("Redact not idempotent on %q: %q", got, again)
+		if got := ToEnvelopeError(&Error{Class: ClassUpstream, Message: in}).Message; got != in {
+			t.Errorf("envelope message = %q, want verbatim %q", got, in)
 		}
 	}
 }

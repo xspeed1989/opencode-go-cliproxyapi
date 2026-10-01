@@ -220,7 +220,7 @@ func decodeEvent[T any](eventType, payload string, v *T) *errclass.Error {
 	}
 	if err := json.Unmarshal([]byte(payload), v); err != nil {
 		return errclass.Translation(fmt.Sprintf(
-			"malformed %s event payload: %s", eventType, shared.RedactedSnippet(payload)))
+			"malformed %s event payload: %s", eventType, shared.ErrorSnippet(payload)))
 	}
 	return nil
 }
@@ -353,7 +353,7 @@ func (sc *StreamConverter) convertEvent(eventType, payload string) ([][]byte, bo
 		// validated without materializing a discarded generic graph.
 		if payload != "" && !json.Valid([]byte(payload)) {
 			return nil, false, errclass.Translation(fmt.Sprintf(
-				"malformed %s event payload: %s", eventType, shared.RedactedSnippet(payload)))
+				"malformed %s event payload: %s", eventType, shared.ErrorSnippet(payload)))
 		}
 		return nil, false, nil
 	}

@@ -471,29 +471,29 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		debugTrace("executor stream read chunk_len=%d closed=%t readErrMsg=%q err=%v", len(payload), closed, readErrMsg, err)
 		upstreamClosed = closed
 		if aborted.Load() {
-			closeStreams(errclass.Redact("stream exceeded request-timeout"))
+			closeStreams("stream exceeded request-timeout")
 			return
 		}
 		if err != nil {
-			closeStreams(errclass.Redact(err.Error()))
+			closeStreams(err.Error())
 			return
 		}
 		if readErrMsg != "" {
-			closeStreams(errclass.Redact(readErrMsg))
+			closeStreams(readErrMsg)
 			return
 		}
 		total += int64(len(payload))
 		if total > res.cfg.MaxResponseBytes {
-			closeStreams(errclass.Redact("stream exceeded max-response-bytes"))
+			closeStreams("stream exceeded max-response-bytes")
 			return
 		}
 		events, done, convErr := conv.Feed(payload)
 		if convErr != nil {
-			closeStreams(errclass.Redact(convErr.Message))
+			closeStreams(convErr.Message)
 			return
 		}
 		if emitErr := m.emitAll(downID, events); emitErr != nil {
-			closeStreams(errclass.Redact(emitErr.Error()))
+			closeStreams(emitErr.Error())
 			return
 		}
 		convDone = done
@@ -506,7 +506,7 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		if flusher, ok := conv.(interface{ Flush() [][]byte }); ok {
 			flushed := flusher.Flush()
 			if emitErr := m.emitAll(downID, flushed); emitErr != nil {
-				closeStreams(errclass.Redact(emitErr.Error()))
+				closeStreams(emitErr.Error())
 				return
 			}
 		}

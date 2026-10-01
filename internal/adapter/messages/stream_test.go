@@ -151,30 +151,26 @@ func TestStreamStrayBlankLineAndDataOnlyEvent(t *testing.T) {
 	}
 }
 
-func TestStreamMalformedJSONRedactedSnippet(t *testing.T) {
+func TestStreamMalformedJSONReportsUpstreamSnippet(t *testing.T) {
 	sc := NewStreamConverter("openai")
 	_, _, eErr := feed(t, sc, "data: {oops \"t\":\"bearer sk-secret-value\"}\n\n")
 	if eErr == nil || eErr.Class != errclass.ClassTranslation {
 		t.Fatalf("want ClassTranslation, got %+v", eErr)
 	}
-	if strings.Contains(eErr.Message, "sk-secret-value") {
-		t.Errorf("secret leaked: %q", eErr.Message)
-	}
-	if !strings.Contains(eErr.Message, "Bearer [redacted]") {
-		t.Errorf("token not redacted: %q", eErr.Message)
+	// Redaction was removed by operator decision (v0.1.13): the malformed
+	// payload is reported verbatim so the failure is diagnosable.
+	if !strings.Contains(eErr.Message, "sk-secret-value") {
+		t.Errorf("upstream payload missing: %q", eErr.Message)
 	}
 
-	long := "{oops" + strings.Repeat("A", 300)
-	_, _, eErr = feed(t, NewStreamConverter("openai"), "data: "+long+"\n\n")
+	// A long payload is reported as a bounded snippet, never echoed whole.
+	tail := strings.Repeat("A", 4096)
+	_, _, eErr = feed(t, NewStreamConverter("openai"), "data: {oops"+tail+"\n\n")
 	if eErr == nil {
 		t.Fatal("want error")
 	}
-	// Shared RedactedSnippet truncates to 80 payload chars + "...".
-	if n := len(eErr.Message) - len("malformed SSE data JSON: "); n > 83 {
-		t.Errorf("snippet too long: %d chars in %q", n, eErr.Message)
-	}
-	if !strings.HasSuffix(eErr.Message, "...") {
-		t.Errorf("snippet missing ellipsis: %q", eErr.Message)
+	if !strings.HasSuffix(eErr.Message, "...") || strings.Contains(eErr.Message, tail) {
+		t.Errorf("snippet not bounded: %q", eErr.Message)
 	}
 }
 
