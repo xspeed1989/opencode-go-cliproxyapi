@@ -343,3 +343,36 @@ func TestConvertChatUsageDetails(t *testing.T) {
 		}
 	}
 }
+
+// Non-stream parity with the streaming sibling: a Chat Completions response
+// carrying reasoning_content leads its Responses output with a reasoning item
+// so the client can replay the chain of thought.
+func TestChatToResponsesCarriesReasoning(t *testing.T) {
+	out, eErr := ConvertNonStreamResponse("openai-response", 200,
+		[]byte(`{"id":"r1","model":"m","choices":[{"message":{"role":"assistant","content":"hi","reasoning_content":"think"},"finish_reason":"stop"}]}`))
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	output := got["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("output = %v", output)
+	}
+	first := output[0].(map[string]any)
+	if first["type"] != "reasoning" || first["status"] != "completed" || first["id"] != "r1-rs" {
+		t.Fatalf("reasoning item wrong: %v", first)
+	}
+	if s, ok := first["summary"].([]any); !ok || len(s) != 0 {
+		t.Fatalf("summary must be an explicit empty list: %v", first["summary"])
+	}
+	part := first["content"].([]any)[0].(map[string]any)
+	if part["type"] != "reasoning_text" || part["text"] != "think" {
+		t.Fatalf("reasoning content wrong: %v", part)
+	}
+	if msg := output[1].(map[string]any); msg["type"] != "message" {
+		t.Fatalf("message must follow reasoning: %v", output)
+	}
+}

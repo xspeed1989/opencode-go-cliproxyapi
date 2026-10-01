@@ -2,33 +2,25 @@
 
 ### Fix
 
-- Normalize replayed tool-call ids on the Responses route. Every `function_call` / `function_call_output` id in an upstream-bound Responses request is rewritten into the upstream's own marked shape (`call_<NN>_ET_<suffix>`) unless it already carries it. Applies to all three source formats: native Responses passthrough, Chat Completions, and Anthropic Messages.
+- Carry the chain of thought end to end on the Chat Completions route instead of dropping it:
+  - **Upstream → client**: `reasoning_content` streamed by the upstream is no longer discarded. A Responses client receives it as a reasoning item that leads the output (`response.output_item.added` → `response.reasoning_text.delta` → `response.reasoning_text.done` → `response.output_item.done`, item carrying one `reasoning_text` part and an explicit empty `summary`), and the terminal `response.completed` output leads with the same item. Non-streaming conversions carry it too.
+  - **Client → upstream**: replayed reasoning items map to `reasoning_content` on the assistant message of their own turn (the message carrying that turn's `tool_calls`), and Anthropic `thinking` blocks do the same. `redacted_thinking` stays omitted — it is encrypted metadata with no plaintext to carry.
+- Decode the Anthropic `thinking` wire field: thinking blocks carry their plaintext in `thinking`, not `text`, so the block decoder previously normalized it to an empty string and every Claude-source translator saw blank thinking.
 
 ### Why
 
-The upstream this plugin fronts runs DeepSeek in thinking mode. A replayed history is accepted only when, for every tool-call turn, one of these holds:
+The upstreams this plugin fronts require their chain of thought back once `tools` are in play, and the replayed reasoning is spliced into the model's context rather than merely validated. The Chat Completions adapter parsed upstream chunks into typed structs (`content`, `tool_calls`) with no reasoning field and omitted reasoning items when building requests, so the thinking was dropped in both directions. That does not fail loudly: the tool loop simply continues without the earlier plan, exclusions, and intermediate conclusions, which shows up as repeated work, dropped plans, and target drift across turns.
 
-1. the turn's reasoning item is replayed (`include: ["reasoning.encrypted_content"]` history), or
-2. the call id carries the upstream's own marker (`call_NN_ET_…`) — such calls are accepted without reasoning, or
-3. the upstream still recognizes the id from its own live session state.
+### Scope
 
-Otherwise the request is refused with HTTP 400 `The \`reasoning_text\` in the thinking mode must be passed back to the API.` Measured against the live endpoint with an otherwise identical body:
-
-| replayed history | reasoning item | call id | result |
-| --- | --- | --- | --- |
-| any id, including `call_1` | present | — | 200 |
-| reasoning stripped | absent | `call_00_ET_…` | 200 |
-| reasoning stripped | absent | `call_1`, `call_00_ZZZ…`, `call_00_<random>` | 400 |
-
-Clients that never store thinking (or store it only sometimes), histories produced while a model was served through another route (whose ids the endpoint cannot know), and sessions whose upstream state expired therefore failed permanently on every follow-up request — the reasoning the error asks for cannot be reconstructed after the fact.
-
-Marking the ids makes condition 2 always true, so a reasoning-free replay is valid. The mapping is a pure function of the original id (already-marked ids pass through untouched), so a call and its output always normalize to the same value and repeated replays stay stable. Verified end-to-end against the live endpoint: a reasoning-free history with foreign ids returns 400 before the change and 200 after it.
+- Chat Completions route only. The native Responses passthrough and the Chat Completions passthrough already forward reasoning verbatim in both directions and are unchanged.
+- The Messages route's Responses-to-Anthropic synthesis still drops upstream thinking (no Anthropic `signature` exists upstream); that remains a known gap, deliberately not changed here.
 
 ### Upgrade Notes
 
 - Update from this fork's plugin-store source (or replace the plugin binary) and reload CLIProxyAPI.
-- Already-failing sessions are recoverable: the rewrite happens on every request, so a resumed transcript with previously unaccepted ids is healed — no need to start over.
-- Ids seen by the upstream may differ from the ids the client sent; they remain opaque strings in every protocol that carries them.
-- No other behavior changed: bodies without tool calls are still forwarded byte-identically.
+- Responses-speaking clients paired with Chat Completions-routed models (`deepseek-v4-pro`, `glm-*`, and friends) are the main beneficiaries: their tool turns now carry the plan forward.
+- Extra reasoning content means more input tokens per replay, which is the documented behaviour of these upstreams; a client that prefers to drop it can do so in its own history.
+- No other behaviour changed: the tool-call id normalization from v0.1.14 and the verbatim error reporting from v0.1.13 are untouched.
 
-**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.13...v0.1.14
+**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.14...v0.1.15

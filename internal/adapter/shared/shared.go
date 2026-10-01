@@ -686,6 +686,23 @@ func (e ResponsesEventEmitter) ItemDone(outputIndex int, item any) []byte {
 	})
 }
 
+// ReasoningDelta streams one partial reasoning_text delta referencing the
+// announced reasoning item by item_id and output_index. DeepSeek-style
+// upstreams stream the chain of thought this way before any output text.
+func (e ResponsesEventEmitter) ReasoningDelta(itemID string, outputIndex int, delta string) []byte {
+	return SSEEvent("response.reasoning_text.delta", map[string]any{
+		"type": "response.reasoning_text.delta", "item_id": itemID, "output_index": outputIndex, "delta": delta,
+	})
+}
+
+// ReasoningDone closes the announced reasoning item's text stream with the
+// complete accumulated chain of thought, mirroring the upstream's own event.
+func (e ResponsesEventEmitter) ReasoningDone(itemID string, outputIndex int, text string) []byte {
+	return SSEEvent("response.reasoning_text.done", map[string]any{
+		"type": "response.reasoning_text.done", "item_id": itemID, "output_index": outputIndex, "text": text,
+	})
+}
+
 // MessageDoneItem renders the canonical aggregated message item: one
 // output_text part carrying every observed text fragment.
 func MessageDoneItem(id, text string) RespItem {
@@ -697,6 +714,20 @@ func MessageDoneItem(id, text string) RespItem {
 // (F-R5 shape: no "id" key) with complete accumulated arguments.
 func FunctionCallDoneItem(callID, name, args string) RespItem {
 	return RespItem{Type: "function_call", CallID: callID, Name: name, Arguments: args}
+}
+
+// ReasoningDoneItem renders the canonical reasoning item: one reasoning_text
+// part carrying the observed chain of thought, plus an explicit empty summary
+// list (clients read summary first; a missing field and an empty one must not
+// be distinguishable in what they store and replay). Rendered as a map because
+// RespItem's summary field cannot carry an explicit empty array through
+// omitempty.
+func ReasoningDoneItem(id, text string) map[string]any {
+	return map[string]any{
+		"type": "reasoning", "id": id, "status": "completed",
+		"summary": []any{},
+		"content": []any{map[string]any{"type": "reasoning_text", "text": text}},
+	}
 }
 
 // Completed renders the terminal response.completed event: status from the
@@ -1219,9 +1250,10 @@ type claudeWireMessage struct {
 
 // claudeWireBlock mirrors the inbound Anthropic block shape (decode-only).
 type claudeWireBlock struct {
-	Type   string `json:"type"`
-	Text   string `json:"text"`
-	Source *struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking string `json:"thinking"` // thinking blocks carry their plaintext here, not in "text"
+	Source   *struct {
 		Type      string `json:"type"` // base64 | url
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
@@ -1321,6 +1353,13 @@ func decodeClaudeBlocks(raw json.RawMessage) ([]ClaudeBlock, *errclass.Error) {
 			Result: wb.Content, IsError: wb.IsError,
 		}
 		switch wb.Type {
+		case "thinking":
+			// Anthropic carries the chain of thought in "thinking", not
+			// "text"; surface it on Text so every Claude-source translator
+			// can carry it forward instead of storing a silent blank.
+			if blk.Text == "" {
+				blk.Text = wb.Thinking
+			}
 		case "image":
 			if wb.Source == nil {
 				return nil, errclass.Translation("image block missing source")

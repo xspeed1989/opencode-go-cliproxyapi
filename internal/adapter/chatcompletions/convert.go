@@ -11,8 +11,9 @@ import (
 // ---- upstream Chat Completions response shapes (FR-006) ----
 
 type ccRespMessage struct {
-	Content   json.RawMessage     `json:"content"` // JSON string or part array
-	ToolCalls []shared.CCToolCall `json:"tool_calls"`
+	Content          json.RawMessage     `json:"content"` // JSON string or part array
+	ReasoningContent string              `json:"reasoning_content"`
+	ToolCalls        []shared.CCToolCall `json:"tool_calls"`
 }
 
 type ccChoice struct {
@@ -179,7 +180,9 @@ func chatToResponses(body []byte) ([]byte, *errclass.Error) {
 	}
 	// The shared assembler gives Chat Completions placement (no reserved
 	// slot): the message leads and appears only when text is non-empty,
-	// matching the streaming terminal (FR-006 sibling parity).
+	// matching the streaming terminal (FR-006 sibling parity). The reasoning
+	// item leads the message: the upstream streams the chain of thought
+	// before any content, and clients that replay it must receive it.
 	oa := shared.NewOutputAssembler(resp.ID)
 	for _, b := range blocks {
 		if b["type"] != "text" {
@@ -191,7 +194,10 @@ func chatToResponses(body []byte) ([]byte, *errclass.Error) {
 	for _, tc := range choice.Message.ToolCalls {
 		oa.AppendFunctionCall(tc.ID, tc.Function.Name, shared.DefaultArgs(tc.Function.Arguments))
 	}
-	out.Output = oa.Render()
+	if reason := choice.Message.ReasoningContent; reason != "" {
+		out.Output = append(out.Output, shared.ReasoningDoneItem(resp.ID+"-rs", reason))
+	}
+	out.Output = append(out.Output, oa.Render()...)
 	if resp.Usage != nil {
 		var details shared.UsageDetails
 		if resp.Usage.PromptDetails != nil {

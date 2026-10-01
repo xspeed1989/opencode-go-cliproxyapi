@@ -1015,3 +1015,89 @@ func TestStreamConverterFlushAfterFinishWithoutDONE(t *testing.T) {
 		}
 	})
 }
+
+// DeepSeek-style upstreams stream the chain of thought as reasoning_content.
+// A Responses client must receive it as a reasoning item that leads the
+// output, because the same upstream requires that reasoning back once tools
+// are in play: dropping it here would make every tool turn lose its plan.
+func TestStreamConverterResponsesCarriesReasoning(t *testing.T) {
+	sc := NewStreamConverter("openai-response")
+	evs := feedAll(t, sc, `data: {"id":"r1","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}`)
+	if len(evs) != 1 || evs[0].Name != "response.created" {
+		t.Fatalf("first chunk must announce response.created: %v", evs)
+	}
+	evs = feedAll(t, sc, `data: {"choices":[{"delta":{"reasoning_content":"think "}}]}`)
+	if len(evs) != 2 || evs[0].Name != "response.output_item.added" || evs[1].Name != "response.reasoning_text.delta" {
+		t.Fatalf("reasoning must announce its item then stream text: %v", evs)
+	}
+	if evs[0].Data["output_index"] != float64(0) {
+		t.Fatalf("reasoning must lead the output: %v", evs[0])
+	}
+	item := evs[0].Data["item"].(map[string]any)
+	if item["type"] != "reasoning" || item["id"] != "r1-rs" || item["status"] != "in_progress" {
+		t.Fatalf("reasoning item wrong: %v", item)
+	}
+	if d := evs[1].Data; d["item_id"] != "r1-rs" || d["output_index"] != float64(0) || d["delta"] != "think " {
+		t.Fatalf("reasoning delta wrong: %v", d)
+	}
+	evs = feedAll(t, sc, `data: {"choices":[{"delta":{"reasoning_content":"hard"}}]}`)
+	if len(evs) != 1 || evs[0].Name != "response.reasoning_text.delta" || evs[0].Data["delta"] != "hard" {
+		t.Fatalf("later fragments must reuse the announced item: %v", evs)
+	}
+	evs = feedAll(t, sc, `data: {"choices":[{"delta":{"content":"hi"}}]}`)
+	if len(evs) != 2 || evs[0].Name != "response.output_item.added" || evs[0].Data["output_index"] != float64(1) {
+		t.Fatalf("message must follow the reasoning item: %v", evs)
+	}
+	evs = feedAll(t, sc, `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`)
+	if len(evs) != 0 {
+		t.Fatalf("response.completed must be deferred past finish_reason: %v", evs)
+	}
+	evs = feedAll(t, sc, `data: {"choices":[]}`)
+	if len(evs) != 4 ||
+		evs[0].Name != "response.reasoning_text.done" ||
+		evs[1].Name != "response.output_item.done" ||
+		evs[2].Name != "response.output_item.done" ||
+		evs[3].Name != "response.completed" {
+		t.Fatalf("terminal lifecycle wrong: %v", evs)
+	}
+	if evs[0].Data["text"] != "think hard" || evs[0].Data["item_id"] != "r1-rs" {
+		t.Fatalf("reasoning_text.done wrong: %v", evs[0].Data)
+	}
+	done := evs[1].Data["item"].(map[string]any)
+	if done["type"] != "reasoning" || done["status"] != "completed" || done["id"] != "r1-rs" {
+		t.Fatalf("reasoning item done wrong: %v", done)
+	}
+	if s, ok := done["summary"].([]any); !ok || len(s) != 0 {
+		t.Fatalf("summary must be an explicit empty list: %v", done["summary"])
+	}
+	if p := done["content"].([]any)[0].(map[string]any); p["type"] != "reasoning_text" || p["text"] != "think hard" {
+		t.Fatalf("reasoning content wrong: %v", p)
+	}
+	resp := evs[3].Data["response"].(map[string]any)
+	output := resp["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("completed output = %v", output)
+	}
+	if out0 := output[0].(map[string]any); out0["type"] != "reasoning" || out0["id"] != "r1-rs" {
+		t.Fatalf("completed output must lead with the reasoning item: %v", output)
+	}
+	if out1 := output[1].(map[string]any); out1["type"] != "message" {
+		t.Fatalf("completed output must keep the message: %v", output)
+	}
+}
+
+// Reasoning-free streams keep producing no reasoning item (no phantom item on
+// the ordinary path).
+func TestStreamConverterResponsesReasoningAbsent(t *testing.T) {
+	sc := NewStreamConverter("openai-response")
+	evs := feedAll(t, sc,
+		`data: {"id":"r1","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}`,
+		`data: {"choices":[{"delta":{"content":"hi"}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: {"choices":[]}`)
+	for _, e := range evs {
+		if e.Name == "response.reasoning_text.delta" || e.Name == "response.reasoning_text.done" {
+			t.Fatalf("reasoning events without reasoning_content: %v", e)
+		}
+	}
+}

@@ -854,3 +854,80 @@ func TestBuildOpenAIRequestDeveloperRole(t *testing.T) {
 		t.Fatalf("expected role %q, got %q", "system", got)
 	}
 }
+
+// A replayed Responses reasoning item maps to reasoning_content on the
+// assistant message of its own turn: the upstream requires its chain of
+// thought back once tools are in play, and dropping it degrades the tool
+// loop silently instead of failing loudly.
+func TestResponsesToChatReplaysReasoningOnToolTurn(t *testing.T) {
+	m := mustBuild(t, "openai-response", `{"model":"x","stream":false,"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"type":"reasoning","id":"rs1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"ok"}
+	]}`, nil)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	asst := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" || asst["reasoning_content"] != "plan A" {
+		t.Fatalf("assistant reasoning not replayed: %v", asst)
+	}
+	if len(asst["tool_calls"].([]any)) != 1 {
+		t.Fatalf("tool_calls lost while attaching reasoning: %v", asst)
+	}
+	if tool := msgs[2].(map[string]any); tool["reasoning_content"] != nil {
+		t.Fatalf("reasoning leaked past its tool turn: %v", tool)
+	}
+}
+
+// Attachment rules: summary text is the fallback when no plaintext content
+// arrived, an assistant text message carries it too, and a user turn in
+// between drops it rather than leaking into a later turn.
+func TestResponsesToChatReasoningAttachmentRules(t *testing.T) {
+	t.Run("summary fallback reaches the assistant message", func(t *testing.T) {
+		m := mustBuild(t, "openai-response", `{"model":"x","input":[
+			{"type":"reasoning","id":"rs1","summary":[{"type":"summary_text","text":"sum"}],"content":[]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}
+		]}`, nil)
+		asst := m["messages"].([]any)[0].(map[string]any)
+		if asst["reasoning_content"] != "sum" {
+			t.Fatalf("summary not used as fallback: %v", asst)
+		}
+	})
+
+	t.Run("orphan reasoning is dropped, not leaked", func(t *testing.T) {
+		m := mustBuild(t, "openai-response", `{"model":"x","input":[
+			{"type":"reasoning","id":"rs1","content":[{"type":"reasoning_text","text":"orphan"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hey"}]}
+		]}`, nil)
+		for _, raw := range m["messages"].([]any) {
+			if raw.(map[string]any)["reasoning_content"] != nil {
+				t.Fatalf("orphan reasoning leaked: %v", raw)
+			}
+		}
+	})
+}
+
+// Anthropic thinking blocks map to reasoning_content (their Chat Completions
+// carrier); redacted_thinking stays omitted since it is encrypted metadata.
+func TestClaudeToChatReplaysThinkingAsReasoningContent(t *testing.T) {
+	m := mustBuild(t, "claude", `{"model":"x","max_tokens":16,"messages":[{"role":"assistant","content":[
+		{"type":"thinking","thinking":"deliberate","signature":"sig"},
+		{"type":"redacted_thinking","data":"opaque"},
+		{"type":"text","text":"answer"},
+		{"type":"tool_use","id":"t1","name":"f","input":{}}
+	]}]}`, nil)
+	asst := m["messages"].([]any)[0].(map[string]any)
+	if asst["reasoning_content"] != "deliberate" {
+		t.Fatalf("thinking not carried as reasoning_content: %v", asst)
+	}
+	if asst["content"] != "answer" {
+		t.Fatalf("text content lost: %v", asst)
+	}
+	if len(asst["tool_calls"].([]any)) != 1 {
+		t.Fatalf("tool_use lost: %v", asst)
+	}
+}

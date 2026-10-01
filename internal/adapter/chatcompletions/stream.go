@@ -43,6 +43,9 @@ type StreamConverter struct {
 	terminalSent bool            // claudeTerminal already emitted message_delta (Flush must still close with message_stop)
 	flushed      bool            // Flush already ran (one-shot guard)
 	respText     strings.Builder // openai-response accumulated output_text
+	reasonIdx    int             // announced reasoning item index (-1 until reasoning arrives)
+	reasonID     string          // reasoning item identity (kept distinct from the message item's)
+	reasoning    strings.Builder // openai-response accumulated chain of thought
 }
 
 // streamTool accumulates one upstream tool_calls index; args collects
@@ -62,6 +65,7 @@ func NewStreamConverter(sourceFormat string) *StreamConverter {
 	return &StreamConverter{
 		sourceFormat: sourceFormat,
 		msgIndex:     -1,
+		reasonIdx:    -1,
 		tools:        map[int64]*streamTool{},
 	}
 }
@@ -185,8 +189,9 @@ type ccToolCallDelta struct {
 }
 
 type ccDelta struct {
-	Content   string            `json:"content"`
-	ToolCalls []ccToolCallDelta `json:"tool_calls"`
+	Content          string            `json:"content"`
+	ReasoningContent string            `json:"reasoning_content"`
+	ToolCalls        []ccToolCallDelta `json:"tool_calls"`
 }
 
 type ccChunkChoice struct {
@@ -445,6 +450,25 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 		return events, nil
 	}
 	choice := chunk.Choices[0]
+	// Reasoning leads the output: DeepSeek-style upstreams stream the chain
+	// of thought as reasoning_content before any content or tool_calls, and
+	// the same upstreams require that reasoning back once tools are in play,
+	// so it must survive the conversion instead of being dropped with the
+	// unknown-field policy. Announce the item before its first delta so
+	// index-pairing clients open the thinking slot in order.
+	if choice.Delta.ReasoningContent != "" {
+		if sc.reasonIdx < 0 {
+			sc.reasonIdx = sc.nextIndex
+			sc.nextIndex++
+			sc.reasonID = sc.id + "-rs"
+			events = append(events, sc.responsesEm().ItemAdded(sc.reasonIdx, map[string]any{
+				"type": "reasoning", "id": sc.reasonID, "status": "in_progress",
+				"summary": []any{}, "content": []any{},
+			}))
+		}
+		sc.reasoning.WriteString(choice.Delta.ReasoningContent)
+		events = append(events, sc.responsesEm().ReasoningDelta(sc.reasonID, sc.reasonIdx, choice.Delta.ReasoningContent))
+	}
 	if choice.Delta.Content != "" {
 		if sc.msgIndex < 0 {
 			sc.msgIndex = sc.nextIndex
@@ -505,27 +529,35 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 	// else completed. Tool calls are represented by output items, not
 	// status vocabulary (F-R2, Messages-route parity).
 	status := shared.ResponseStatusFromCCFinish(finish)
-	// Shared assembler (FR-006 sibling parity): the terminal payload
-	// carries the output items fed in ARRIVAL order so Render() reproduces
-	// the streamed output_item.added indexes exactly — the message slot is
-	// pinned at sc.msgIndex (assigned at the first text delta, after any
-	// tools-first announcements), never displacing already-announced
-	// function_call items; this mirrors the Messages-route invariant that
-	// terminal output order equals announcement order (W4 pin).
-	oa := shared.NewOutputAssembler(sc.id)
-	reserved := false
+	// Completed output is rendered in announcement order — reasoning item,
+	// function_call items, assistant message — i.e. exactly the output_index
+	// order the streamed events used, so a client that pairs items by index
+	// stays aligned with what it received (W4 pin).
+	type outItem struct {
+		index int
+		item  any
+	}
+	ordered := make([]outItem, 0, len(sc.toolOrder)+2)
+	if sc.reasonIdx >= 0 {
+		ordered = append(ordered, outItem{sc.reasonIdx,
+			shared.ReasoningDoneItem(sc.reasonID, sc.reasoning.String())})
+	}
 	for _, idx := range sc.toolOrder {
 		t := sc.tools[idx]
-		if sc.msgIndex >= 0 && !reserved && t.blockIndex > sc.msgIndex {
-			oa.ReserveTextSlot()
-			reserved = true
+		if t == nil {
+			continue
 		}
-		oa.AppendFunctionCall(t.id, t.name, shared.DefaultArgs(t.args.String()))
+		ordered = append(ordered, outItem{t.blockIndex,
+			shared.FunctionCallDoneItem(t.id, t.name, shared.DefaultArgs(t.args.String()))})
 	}
-	if sc.msgIndex >= 0 && !reserved {
-		oa.ReserveTextSlot()
+	if sc.msgIndex >= 0 {
+		ordered = append(ordered, outItem{sc.msgIndex, shared.MessageDoneItem(sc.id, sc.respText.String())})
 	}
-	oa.AddText(sc.respText.String())
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
+	output := make([]any, 0, len(ordered))
+	for _, it := range ordered {
+		output = append(output, it.item)
+	}
 	// Always attach (F-R6): zero-valued fields when upstream sent none.
 	input, outputTokens := int64(0), int64(0)
 	if sc.usage != nil {
@@ -543,14 +575,15 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 	}
 	usage := shared.NewResponsesUsageFrom(input, outputTokens, details)
 	events := sc.responsesItemCompletions()
-	return append(events, sc.responsesEm().Completed(status, usage, oa.Render()))
+	return append(events, sc.responsesEm().Completed(status, usage, output))
 }
 
 // responsesItemCompletions closes every announced output item in
-// output_index order before the terminal response.completed: the complete
+// output_index order before the terminal response.completed: the reasoning
+// text and its item (response.reasoning_text.done), the complete
 // function_call arguments (response.function_call_arguments.done) and the
 // item itself (response.output_item.done), plus the aggregated message
-// item. Chat Completions upstreams have no such frame, but Responses
+// item. Chat Completions upstreams have no such frames, but Responses
 // clients validate the tool-call lifecycle and refuse a turn whose
 // function_call item never completes, since its arguments may be cut off.
 func (sc *StreamConverter) responsesItemCompletions() [][]byte {
@@ -559,7 +592,14 @@ func (sc *StreamConverter) responsesItemCompletions() [][]byte {
 		index int
 		evs   [][]byte
 	}
-	items := make([]pending, 0, len(sc.toolOrder)+1)
+	items := make([]pending, 0, len(sc.toolOrder)+2)
+	if sc.reasonIdx >= 0 {
+		text := sc.reasoning.String()
+		items = append(items, pending{sc.reasonIdx, [][]byte{
+			em.ReasoningDone(sc.reasonID, sc.reasonIdx, text),
+			em.ItemDone(sc.reasonIdx, shared.ReasoningDoneItem(sc.reasonID, text)),
+		}})
+	}
 	for _, idx := range sc.toolOrder {
 		t := sc.tools[idx]
 		if t == nil {

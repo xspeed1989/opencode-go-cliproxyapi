@@ -80,6 +80,19 @@ The upstream Responses endpoint runs DeepSeek in thinking mode and refuses a rep
 
 Clients that never stored thinking, and histories whose calls were produced through another route, satisfy none of those conditions and failed permanently. On the Responses route the plugin therefore rewrites every upstream-bound `function_call` / `function_call_output` id that lacks the marker into the marked shape, for native Responses, Chat Completions, and Anthropic Messages sources alike. The mapping is a pure function of the original id (marked ids pass through untouched), so a call and its output stay paired and repeated replays are stable; ids are opaque, but the values the upstream sees may differ from the ones the client sent. Requests without tool calls are still forwarded byte-identically.
 
+## Reasoning round-trip
+
+The upstreams this plugin fronts require their chain of thought back once `tools` are in play, and the replayed reasoning is spliced into the model's context. Missing it does not fail loudly: the tool loop simply continues without the earlier plan and intermediate conclusions.
+
+| Path | Behaviour |
+|---|---|
+| Responses passthrough | Verbatim both ways (native `reasoning` items, plaintext `reasoning_text`) |
+| Chat Completions passthrough | Verbatim both ways (`reasoning_content`) |
+| Chat Completions upstream → Responses client | `reasoning_content` becomes a leading reasoning item (`response.reasoning_text.delta` / `.done`), also in non-streaming conversions |
+| Responses client → Chat Completions upstream | Replayed reasoning items become `reasoning_content` on the assistant message of their own turn |
+| Anthropic `thinking` blocks → Chat Completions upstream | Carried as `reasoning_content`; `redacted_thinking` stays omitted (encrypted metadata) |
+| Responses upstream → Anthropic client | Not carried: the upstream has no Anthropic `signature` to send |
+
 ## Configuration
 
 Configure the plugin in your CLIProxyAPI `config.yaml` under `plugins.configs.opencode-go-cliproxyapi`:
