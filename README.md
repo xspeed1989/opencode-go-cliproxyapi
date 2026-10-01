@@ -88,10 +88,12 @@ The upstreams this plugin fronts require their chain of thought back once `tools
 |---|---|
 | Responses passthrough | Verbatim both ways (native `reasoning` items, plaintext `reasoning_text`) |
 | Chat Completions passthrough | Verbatim both ways (`reasoning_content`) |
-| Chat Completions upstream → Responses client | `reasoning_content` becomes a leading reasoning item (`response.reasoning_text.delta` / `.done`), also in non-streaming conversions |
-| Responses client → Chat Completions upstream | Replayed reasoning items become `reasoning_content` on the assistant message of their own turn |
-| Anthropic `thinking` blocks → Chat Completions upstream | Carried as `reasoning_content`; `redacted_thinking` stays omitted (encrypted metadata) |
+| Chat Completions upstream → Responses client | `reasoning_content` becomes a leading reasoning item (`response.reasoning_text.delta` / `.done`), also in non-streaming conversions; applies to every model that streams the field |
+| Responses client → Chat Completions upstream | Replayed reasoning items become `reasoning_content` on the assistant message of their own turn — only for the `deepseek*` family, whose endpoints require the replay |
+| Anthropic `thinking` blocks → Chat Completions upstream | Same `deepseek*`-only rule; `redacted_thinking` stays omitted (encrypted metadata) |
 | Responses upstream → Anthropic client | Not carried: the upstream has no Anthropic `signature` to send |
+
+The client → upstream replay is gated because replaying a field an endpoint never asked for is the only direction that can fail a request; the upstream → client direction is ungated because it only forwards a chain of thought the upstream actually streamed. Extend `reasoningReplayFamilies` in `internal/adapter/chatcompletions/request.go` if another family turns out to need the replay.
 
 ## Configuration
 

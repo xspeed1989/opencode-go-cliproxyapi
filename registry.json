@@ -4,7 +4,7 @@
     {
       "id": "opencode-go-cliproxyapi",
       "name": "OpenCode Go CLIProxyAPI",
-      "description": "OpenCode Go provider for CLIProxyAPI: Responses tool-call lifecycle fix, tool-call id normalization (reasoning-free replays no longer fail with 400), and chain-of-thought round-trip on the Chat Completions route.",
+      "description": "OpenCode Go provider for CLIProxyAPI: Responses tool-call lifecycle fix, tool-call id normalization (reasoning-free replays no longer fail with 400), and chain-of-thought round-trip (client replay limited to the DeepSeek family).",
       "author": "xspeed1989",
       "repository": "https://github.com/xspeed1989/opencode-go-cliproxyapi",
       "homepage": "https://github.com/xspeed1989/opencode-go-cliproxyapi",

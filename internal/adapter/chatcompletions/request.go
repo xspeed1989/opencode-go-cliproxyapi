@@ -188,6 +188,7 @@ func claudeToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSuppor
 		out.ReasoningEffort = thinking.EffortFromBudget(src.Thinking.BudgetTokens)
 	}
 	applyToolChoiceCC(out, src.ToolChoiceKind, src.ToolChoiceName)
+	replayReasoning := carriesReasoningReplay(upstreamModel)
 	if src.System != "" {
 		out.Messages = append(out.Messages, ccMessage{Role: "system", Content: src.System})
 	}
@@ -201,7 +202,7 @@ func claudeToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSuppor
 			}
 			out.Messages = append(out.Messages, msgs...)
 		case "assistant":
-			msg, eErr := claudeAssistantMessage(m)
+			msg, eErr := claudeAssistantMessage(m, replayReasoning)
 			if eErr != nil {
 				return nil, eErr
 			}
@@ -284,10 +285,10 @@ func claudeUserMessages(m *shared.ClaudeMessageRecord) ([]ccMessage, *errclass.E
 // claudeAssistantMessage converts an assistant turn: text blocks join
 // the message content, tool_use blocks become tool_calls, and thinking
 // blocks map to reasoning_content — the Chat Completions carrier for the
-// chain of thought, which the upstream requires back once tools are in
-// play. The redacted_thinking variant stays omitted: it is pure encrypted
+// chain of thought — when replayReasoning says the upstream family requires
+// it. The redacted_thinking variant stays omitted: it is pure encrypted
 // metadata with no plaintext to carry forward. Returns nil for empty turns.
-func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclass.Error) {
+func claudeAssistantMessage(m *shared.ClaudeMessageRecord, replayReasoning bool) (*ccMessage, *errclass.Error) {
 	msg := &ccMessage{Role: "assistant"}
 	var sb strings.Builder
 	var reasoning strings.Builder
@@ -298,7 +299,11 @@ func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclas
 		case "text":
 			sb.WriteString(blk.Text)
 		case "thinking":
-			reasoning.WriteString(blk.Text)
+			// Only the families whose endpoints require the chain of thought
+			// back get the field; everyone else keeps the previous wire shape.
+			if replayReasoning {
+				reasoning.WriteString(blk.Text)
+			}
 		case "redacted_thinking":
 			// omitted: encrypted metadata only, no plaintext chain of thought
 		case "tool_use":
@@ -320,6 +325,27 @@ func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclas
 		return nil, nil
 	}
 	return msg, nil
+}
+
+// reasoningReplayFamilies lists the upstream model families whose Chat
+// Completions endpoints require the chain of thought back once tools are in
+// play (DeepSeek's documented contract). Replaying reasoning to any other
+// family puts a field their endpoints never asked for onto the wire, so the
+// client→upstream direction stays limited to these prefixes; the
+// upstream→client direction carries whatever the upstream actually streamed,
+// which cannot fail a request.
+var reasoningReplayFamilies = []string{"deepseek"}
+
+// carriesReasoningReplay reports whether upstreamModel's family wants the
+// replayed chain of thought attached to its assistant messages.
+func carriesReasoningReplay(upstreamModel string) bool {
+	id := strings.ToLower(strings.TrimSpace(upstreamModel))
+	for _, prefix := range reasoningReplayFamilies {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // reasoningPlainText extracts the replayed chain of thought from a Responses
@@ -407,7 +433,9 @@ func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSup
 	// assistant message of its own turn: Responses histories place it before
 	// the message/function_call it belongs to. A user turn in between means
 	// the reasoning had no assistant message to attach to, so it is dropped
-	// instead of leaking into a later turn.
+	// instead of leaking into a later turn. Only the families whose endpoints
+	// require the chain of thought back ever get it attached.
+	replayReasoning := carriesReasoningReplay(upstreamModel)
 	pendingReasoning := ""
 	for _, item := range items {
 		switch item.Type {
@@ -477,7 +505,9 @@ func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSup
 				Role: "tool", Content: item.Output, ToolCallID: item.CallID,
 			})
 		case "reasoning":
-			pendingReasoning = reasoningPlainText(item)
+			if replayReasoning {
+				pendingReasoning = reasoningPlainText(item)
+			}
 		default:
 			return nil, shared.UnsupportedInputItemType(item.Type)
 		}

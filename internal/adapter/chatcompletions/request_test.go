@@ -29,6 +29,14 @@ func mustBuild(t *testing.T, sourceFormat, body string, ts *pluginapi.ThinkingSu
 	return decodeOut(t, out, eErr)
 }
 
+// mustBuildModel pins the upstream model when the assertion depends on the
+// upstream family (reasoning replay is family-gated).
+func mustBuildModel(t *testing.T, model, sourceFormat, body string, ts *pluginapi.ThinkingSupport) map[string]any {
+	t.Helper()
+	out, eErr := BuildRequest(model, sourceFormat, []byte(body), ts)
+	return decodeOut(t, out, eErr)
+}
+
 func TestAuthHeaders(t *testing.T) {
 	h := AuthHeaders("sk-test")
 	if got := h.Get("Authorization"); got != "Bearer sk-test" {
@@ -860,7 +868,7 @@ func TestBuildOpenAIRequestDeveloperRole(t *testing.T) {
 // thought back once tools are in play, and dropping it degrades the tool
 // loop silently instead of failing loudly.
 func TestResponsesToChatReplaysReasoningOnToolTurn(t *testing.T) {
-	m := mustBuild(t, "openai-response", `{"model":"x","stream":false,"input":[
+	m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","stream":false,"input":[
 		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
 		{"type":"reasoning","id":"rs1","summary":[],"content":[{"type":"reasoning_text","text":"plan A"}]},
 		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
@@ -887,7 +895,7 @@ func TestResponsesToChatReplaysReasoningOnToolTurn(t *testing.T) {
 // between drops it rather than leaking into a later turn.
 func TestResponsesToChatReasoningAttachmentRules(t *testing.T) {
 	t.Run("summary fallback reaches the assistant message", func(t *testing.T) {
-		m := mustBuild(t, "openai-response", `{"model":"x","input":[
+		m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
 			{"type":"reasoning","id":"rs1","summary":[{"type":"summary_text","text":"sum"}],"content":[]},
 			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}
 		]}`, nil)
@@ -898,7 +906,7 @@ func TestResponsesToChatReasoningAttachmentRules(t *testing.T) {
 	})
 
 	t.Run("orphan reasoning is dropped, not leaked", func(t *testing.T) {
-		m := mustBuild(t, "openai-response", `{"model":"x","input":[
+		m := mustBuildModel(t, "deepseek-v4-pro", "openai-response", `{"model":"x","input":[
 			{"type":"reasoning","id":"rs1","content":[{"type":"reasoning_text","text":"orphan"}]},
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
 			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hey"}]}
@@ -914,7 +922,7 @@ func TestResponsesToChatReasoningAttachmentRules(t *testing.T) {
 // Anthropic thinking blocks map to reasoning_content (their Chat Completions
 // carrier); redacted_thinking stays omitted since it is encrypted metadata.
 func TestClaudeToChatReplaysThinkingAsReasoningContent(t *testing.T) {
-	m := mustBuild(t, "claude", `{"model":"x","max_tokens":16,"messages":[{"role":"assistant","content":[
+	m := mustBuildModel(t, "deepseek-v4-pro", "claude", `{"model":"x","max_tokens":16,"messages":[{"role":"assistant","content":[
 		{"type":"thinking","thinking":"deliberate","signature":"sig"},
 		{"type":"redacted_thinking","data":"opaque"},
 		{"type":"text","text":"answer"},
@@ -930,4 +938,59 @@ func TestClaudeToChatReplaysThinkingAsReasoningContent(t *testing.T) {
 	if len(asst["tool_calls"].([]any)) != 1 {
 		t.Fatalf("tool_use lost: %v", asst)
 	}
+}
+
+// Client -> upstream reasoning replay is limited to the families whose
+// endpoints require it. Every other CC model keeps the exact wire shape of
+// earlier releases: no reasoning_content field at all.
+func TestReasoningReplayLimitedToDeepSeekFamily(t *testing.T) {
+	respBody := `{"model":"x","input":[
+		{"type":"reasoning","id":"rs1","content":[{"type":"reasoning_text","text":"plan"}]},
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}
+	]}`
+	claudeBody := `{"model":"x","max_tokens":16,"messages":[{"role":"assistant","content":[
+		{"type":"thinking","thinking":"plan","signature":"s"},
+		{"type":"tool_use","id":"t1","name":"f","input":{}}
+	]}]}`
+	cases := []struct{ model, want string }{
+		{"deepseek-v4-pro", "plan"},
+		{"deepseek-flash", "plan"},
+		{"DeepSeek-V4.1-Flash", "plan"},
+		{"glm-5.3", ""},
+		{"kimi-k2", ""},
+		{"qwen3-max", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		for format, body := range map[string]string{"openai-response": respBody, "claude": claudeBody} {
+			out, eErr := BuildRequest(tc.model, format, []byte(body), nil)
+			if eErr != nil {
+				t.Fatalf("%s/%s: unexpected error: %v", tc.model, format, eErr)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(out, &decoded); err != nil {
+				t.Fatalf("%s/%s: output is not JSON: %v", tc.model, format, err)
+			}
+			asst := assistantMessageOf(t, decoded)
+			got, _ := asst["reasoning_content"].(string)
+			if got != tc.want {
+				t.Fatalf("%s/%s: reasoning_content = %q, want %q", tc.model, format, got, tc.want)
+			}
+			if len(asst["tool_calls"].([]any)) != 1 {
+				t.Fatalf("%s/%s: tool_calls lost: %v", tc.model, format, asst)
+			}
+		}
+	}
+}
+
+func assistantMessageOf(t *testing.T, decoded map[string]any) map[string]any {
+	t.Helper()
+	for _, raw := range decoded["messages"].([]any) {
+		msg, ok := raw.(map[string]any)
+		if ok && msg["role"] == "assistant" {
+			return msg
+		}
+	}
+	t.Fatalf("no assistant message in %v", decoded["messages"])
+	return nil
 }

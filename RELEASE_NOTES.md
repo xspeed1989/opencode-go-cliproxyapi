@@ -1,26 +1,22 @@
 ## What's Changed
 
-### Fix
+### Change
 
-- Carry the chain of thought end to end on the Chat Completions route instead of dropping it:
-  - **Upstream → client**: `reasoning_content` streamed by the upstream is no longer discarded. A Responses client receives it as a reasoning item that leads the output (`response.output_item.added` → `response.reasoning_text.delta` → `response.reasoning_text.done` → `response.output_item.done`, item carrying one `reasoning_text` part and an explicit empty `summary`), and the terminal `response.completed` output leads with the same item. Non-streaming conversions carry it too.
-  - **Client → upstream**: replayed reasoning items map to `reasoning_content` on the assistant message of their own turn (the message carrying that turn's `tool_calls`), and Anthropic `thinking` blocks do the same. `redacted_thinking` stays omitted — it is encrypted metadata with no plaintext to carry.
-- Decode the Anthropic `thinking` wire field: thinking blocks carry their plaintext in `thinking`, not `text`, so the block decoder previously normalized it to an empty string and every Claude-source translator saw blank thinking.
+- Limit the client → upstream reasoning replay (added in v0.1.15) to the upstream families whose Chat Completions endpoints actually require it: the `deepseek*` models. Replayed reasoning items and Anthropic `thinking` blocks still become `reasoning_content` there, and still never do for any other Chat Completions-routed model (`glm*`, `kimi*`, `mimo*`, `hy*`, `longcat*`), which keep the exact wire shape of earlier releases.
+- The upstream → client direction is deliberately left ungated: it only forwards a chain of thought the upstream actually streamed, so it cannot fail a request, and it keeps working for every model that emits the field.
 
 ### Why
 
-The upstreams this plugin fronts require their chain of thought back once `tools` are in play, and the replayed reasoning is spliced into the model's context rather than merely validated. The Chat Completions adapter parsed upstream chunks into typed structs (`content`, `tool_calls`) with no reasoning field and omitted reasoning items when building requests, so the thinking was dropped in both directions. That does not fail loudly: the tool loop simply continues without the earlier plan, exclusions, and intermediate conclusions, which shows up as repeated work, dropped plans, and target drift across turns.
+Replaying a field an endpoint never asked for is the only direction that can fail a request. Sending `reasoning_content` to a Chat Completions upstream that has no use for it adds no value, while a stricter endpoint could reject the unknown field; the response direction has no such failure mode and only affects what the client sees.
 
-### Scope
+### Cost
 
-- Chat Completions route only. The native Responses passthrough and the Chat Completions passthrough already forward reasoning verbatim in both directions and are unchanged.
-- The Messages route's Responses-to-Anthropic synthesis still drops upstream thinking (no Anthropic `signature` exists upstream); that remains a known gap, deliberately not changed here.
+If a non-DeepSeek Chat Completions model turns out to need the replay (the endpoint enforcing the same "must be passed back" rule), that model keeps failing until its prefix is added to `reasoningReplayFamilies` in `internal/adapter/chatcompletions/request.go` — a one-line change plus a test.
 
 ### Upgrade Notes
 
 - Update from this fork's plugin-store source (or replace the plugin binary) and reload CLIProxyAPI.
-- Responses-speaking clients paired with Chat Completions-routed models (`deepseek-v4-pro`, `glm-*`, and friends) are the main beneficiaries: their tool turns now carry the plan forward.
-- Extra reasoning content means more input tokens per replay, which is the documented behaviour of these upstreams; a client that prefers to drop it can do so in its own history.
-- No other behaviour changed: the tool-call id normalization from v0.1.14 and the verbatim error reporting from v0.1.13 are untouched.
+- DeepSeek-routed models behave exactly as in v0.1.15. Every other Chat Completions-routed model behaves as it did before v0.1.15 for the request direction, while still surfacing whatever reasoning the upstream streams.
+- The Messages and Responses routes are untouched, as are the v0.1.14 tool-call id normalization and the v0.1.13 verbatim error reporting.
 
-**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.14...v0.1.15
+**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.15...v0.1.16
