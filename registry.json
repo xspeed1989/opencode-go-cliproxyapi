@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "opencode-go-cliproxyapi",
+      "name": "OpenCode Go CLIProxyAPI",
+      "description": "OpenCode Go provider for CLIProxyAPI with the Responses tool-call lifecycle fix (output_item.done before response.completed).",
+      "author": "xspeed1989",
+      "repository": "https://github.com/xspeed1989/opencode-go-cliproxyapi",
+      "homepage": "https://github.com/xspeed1989/opencode-go-cliproxyapi",
+      "license": "MIT",
+      "tags": [
+        "provider",
+        "opencode-go"
+      ]
+    }
+  ]
+}

@@ -126,6 +126,22 @@ plugins:
 | `max-response-bytes` | `int64` | `67108864` (64 MiB) | Maximum non-streaming response body size in bytes. |
 | `allow-http` | `bool` | `false` | When `true`, permits `http://` scheme in `base-url` / `catalog-url` for local testing. |
 
+## Install via the plugin store (this fork)
+
+This fork publishes its own plugin-store registry so CLIProxyAPI can install and update it from this repository's GitHub releases. The release assets already follow the store layout (`opencode-go-cliproxyapi_<version>_<goos>_<goarch>.zip` plus `checksums.txt`).
+
+Add the registry as an extra store source and reload the config:
+
+```yaml
+plugins:
+  store-sources:
+    - "https://raw.githubusercontent.com/xspeed1989/opencode-go-cliproxyapi/main/registry.json"
+```
+
+Then open Management Center → Plugin Store and install `opencode-go-cliproxyapi`. The built-in official registry also lists that plugin id for the upstream repository, so when the store asks to choose a source, select the `raw.githubusercontent.com` source.
+
+The store writes `plugins/<goos>/<goarch>/opencode-go-cliproxyapi_<version>.<ext>` and hot-swaps the loaded plugin, so a running server picks up the new version without an overwrite conflict. In Docker deployments keep the plugins directory on a mounted volume, otherwise the installed file disappears when the container is recreated. If the container cannot reach `raw.githubusercontent.com` / `api.github.com` directly, configure `proxy-url` so store requests use the proxy.
+
 ## Testing
 
 ```powershell
