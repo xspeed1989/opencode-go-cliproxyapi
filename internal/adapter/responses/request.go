@@ -10,6 +10,7 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -32,12 +33,14 @@ var EndpointPath = catalog.RouteResponses.EndpointPath()
 // client-facing model ID the request carried (FR-003). Declared efforts
 // pass through unchanged, regardless of ts. Anthropic budgets use a fixed
 // threshold conversion only when no explicit effort is provided.
+// Replayed tool-call ids are normalized to the upstream's marked shape on
+// every source format (see rewritePassthrough and shared.MarkToolCallID).
 // Unknown formats are ClassUnsupported; malformed input is
 // ClassTranslation; messages are descriptive and redacted.
 func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	switch sourceFormat {
 	case "openai-response":
-		return shared.RewriteModelID(upstreamModel, sourceBody, "openai-response")
+		return rewritePassthrough(upstreamModel, sourceBody)
 	case "openai":
 		return fromChatCompletions(upstreamModel, sourceBody, ts)
 	case "claude":
@@ -48,6 +51,95 @@ func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, 
 }
 
 // ---- target wire shape -------------------------------------------------
+
+// rewritePassthrough rewrites the model id and normalizes replayed tool-call
+// ids of a native Responses request. The body is returned byte-identical when
+// neither needs to change, so the passthrough stays transparent for every
+// history without tool calls.
+func rewritePassthrough(upstreamModel string, body []byte) ([]byte, *errclass.Error) {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, errclass.Translation("malformed openai-response request JSON: " + err.Error())
+	}
+	// A literal JSON null body unmarshals without error into a NIL map.
+	if req == nil {
+		return nil, errclass.Translation("malformed request body: JSON null is not a valid request")
+	}
+	changed := false
+	if raw, ok := req["model"]; !ok || string(raw) != `"`+upstreamModel+`"` {
+		id, err := json.Marshal(upstreamModel)
+		if err != nil {
+			return nil, errclass.Translation("model id cannot be represented as JSON")
+		}
+		req["model"] = id
+		changed = true
+	}
+	if raw, ok := req["input"]; ok {
+		if rewritten, idsChanged := markInputCallIDs(raw); idsChanged {
+			req["input"] = rewritten
+			changed = true
+		}
+	}
+	if !changed {
+		return body, nil
+	}
+	out, err := json.Marshal(req)
+	if err != nil {
+		return nil, errclass.Translation("request body cannot be re-encoded as JSON")
+	}
+	return out, nil
+}
+
+// markInputCallIDs marks every replayed function_call/function_call_output id
+// in a native Responses input array. Non-array input (a bare string) and
+// arrays holding non-object entries are returned unchanged: shapes this
+// adapter does not model stay the upstream's business rather than becoming a
+// translation failure here. Non-id fields are carried as raw JSON, so only the
+// rewritten ids are re-encoded.
+func markInputCallIDs(raw json.RawMessage) (json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return raw, false
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &items); err != nil {
+		return raw, false
+	}
+	changed := false
+	for i, item := range items {
+		var typeName string
+		if err := json.Unmarshal(item["type"], &typeName); err != nil {
+			continue
+		}
+		if typeName != "function_call" && typeName != "function_call_output" {
+			continue
+		}
+		var id string
+		if rawID, ok := item["call_id"]; ok {
+			if err := json.Unmarshal(rawID, &id); err != nil {
+				continue
+			}
+		}
+		marked := shared.MarkToolCallID(id, i)
+		if marked == id {
+			continue
+		}
+		encoded, err := json.Marshal(marked)
+		if err != nil {
+			continue
+		}
+		item["call_id"] = encoded
+		changed = true
+	}
+	if !changed {
+		return raw, false
+	}
+	out, err := json.Marshal(items)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
+}
 
 type responsesEnvelope struct {
 	Model             string            `json:"model"`
@@ -171,6 +263,7 @@ func fromChatCompletions(upstreamModel string, body []byte, _ *pluginapi.Thinkin
 	}
 
 	var instr strings.Builder
+	callSeq := 0
 	for i := range src.Messages {
 		m := &src.Messages[i]
 		switch m.Role {
@@ -209,9 +302,11 @@ func fromChatCompletions(upstreamModel string, body []byte, _ *pluginapi.Thinkin
 				req.Input = append(req.Input, msgItem(m.Role, parts))
 			}
 			for _, tc := range m.ToolCalls {
+				callID := shared.MarkToolCallID(tc.ID, callSeq)
+				callSeq++
 				req.Input = append(req.Input, map[string]any{
 					"type":      "function_call",
-					"call_id":   tc.ID,
+					"call_id":   callID,
 					"name":      tc.Function.Name,
 					"arguments": shared.DefaultArgs(tc.Function.Arguments),
 				})
@@ -229,7 +324,7 @@ func fromChatCompletions(upstreamModel string, body []byte, _ *pluginapi.Thinkin
 			}
 			req.Input = append(req.Input, map[string]any{
 				"type":    "function_call_output",
-				"call_id": m.ToolCallID,
+				"call_id": shared.MarkToolCallID(m.ToolCallID, callSeq),
 				"output":  shared.JoinTexts(parts),
 			})
 		default:
@@ -290,6 +385,7 @@ func fromClaudeMessages(upstreamModel string, body []byte, _ *pluginapi.Thinking
 	}
 	req.Instructions = src.System
 
+	callSeq := 0
 	for _, m := range src.Messages {
 		switch m.Role {
 		case "user", "assistant":
@@ -315,9 +411,11 @@ func fromClaudeMessages(upstreamModel string, body []byte, _ *pluginapi.Thinking
 			case "tool_use":
 				flush()
 				args := shared.DefaultArgs(string(blk.Input))
+				callID := shared.MarkToolCallID(blk.CallID, callSeq)
+				callSeq++
 				req.Input = append(req.Input, map[string]any{
 					"type":      "function_call",
-					"call_id":   blk.CallID,
+					"call_id":   callID,
 					"name":      blk.Name,
 					"arguments": args,
 				})
@@ -332,7 +430,7 @@ func fromClaudeMessages(upstreamModel string, body []byte, _ *pluginapi.Thinking
 				}
 				req.Input = append(req.Input, map[string]any{
 					"type":    "function_call_output",
-					"call_id": blk.CallID,
+					"call_id": shared.MarkToolCallID(blk.CallID, callSeq),
 					"output":  output,
 				})
 			case "thinking", "redacted_thinking":

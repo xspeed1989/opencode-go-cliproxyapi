@@ -74,6 +74,12 @@ Native requests retain their effort field. Cross-protocol requests only translat
 
 Catalog reasoning metadata is exposed for clients but is not used as a request allowlist. The upstream can still reject or ignore a value; HTTP success alone does not prove that a requested effort was honored.
 
+## Tool-call id normalization
+
+The upstream Responses endpoint runs DeepSeek in thinking mode and refuses a replayed tool-call history with HTTP 400 `The \`reasoning_text\` in the thinking mode must be passed back to the API.` unless either the turn's reasoning item is replayed, or the call id carries the endpoint's own marker (`call_<NN>_ET_<suffix>`), or the endpoint still recognizes the id from live session state.
+
+Clients that never stored thinking, and histories whose calls were produced through another route, satisfy none of those conditions and failed permanently. On the Responses route the plugin therefore rewrites every upstream-bound `function_call` / `function_call_output` id that lacks the marker into the marked shape, for native Responses, Chat Completions, and Anthropic Messages sources alike. The mapping is a pure function of the original id (marked ids pass through untouched), so a call and its output stay paired and repeated replays are stable; ids are opaque, but the values the upstream sees may differ from the ones the client sent. Requests without tool calls are still forwarded byte-identically.
+
 ## Configuration
 
 Configure the plugin in your CLIProxyAPI `config.yaml` under `plugins.configs.opencode-go-cliproxyapi`:

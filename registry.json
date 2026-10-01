@@ -4,7 +4,7 @@
     {
       "id": "opencode-go-cliproxyapi",
       "name": "OpenCode Go CLIProxyAPI",
-      "description": "OpenCode Go provider for CLIProxyAPI with the Responses tool-call lifecycle fix (output_item.done before response.completed).",
+      "description": "OpenCode Go provider for CLIProxyAPI with the Responses tool-call lifecycle fix and tool-call id normalization (reasoning-free replays no longer fail with 400).",
       "author": "xspeed1989",
       "repository": "https://github.com/xspeed1989/opencode-go-cliproxyapi",
       "homepage": "https://github.com/xspeed1989/opencode-go-cliproxyapi",

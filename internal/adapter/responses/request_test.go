@@ -168,12 +168,12 @@ func TestFromChatCompletionsFull(t *testing.T) {
 		t.Errorf("assistant part = %v (want output_text)", p)
 	}
 	fc := itemMap(t, items, 3)
-	if fc["type"] != "function_call" || fc["call_id"] != "call_1" ||
+	if fc["type"] != "function_call" || !markedCallID(fc["call_id"]) ||
 		fc["name"] != "lookup" || fc["arguments"] != `{"q":"x"}` {
 		t.Errorf("function_call = %v", fc)
 	}
 	fco := itemMap(t, items, 4)
-	if fco["type"] != "function_call_output" || fco["call_id"] != "call_1" || fco["output"] != "result" {
+	if fco["type"] != "function_call_output" || fco["call_id"] != fc["call_id"] || fco["output"] != "result" {
 		t.Errorf("function_call_output = %v", fco)
 	}
 	tools := m["tools"].([]any)
@@ -370,16 +370,16 @@ func TestFromClaudeMessagesFull(t *testing.T) {
 	if p := partMap(t, a, 0); p["type"] != "output_text" || p["text"] != "working" {
 		t.Errorf("assistant part = %v", p)
 	}
-	for i, want := range []struct{ id, args string }{
-		{"tu_1", `{"q":"x"}`}, {"tu_2", "{}"}, {"tu_3", "{}"},
-	} {
+	callIDs := make([]string, 0, 3)
+	for i, wantArgs := range []string{`{"q":"x"}`, "{}", "{}"} {
 		fc := itemMap(t, items, 2+i)
-		if fc["type"] != "function_call" || fc["call_id"] != want.id || fc["arguments"] != want.args {
-			t.Errorf("function_call %d = %v, want %+v", i, fc, want)
+		if fc["type"] != "function_call" || !markedCallID(fc["call_id"]) || fc["arguments"] != wantArgs {
+			t.Errorf("function_call %d = %v, want arguments %s", i, fc, wantArgs)
 		}
+		callIDs = append(callIDs, fc["call_id"].(string))
 	}
 	fco := itemMap(t, items, 5)
-	if fco["output"] != "ok" || fco["call_id"] != "tu_1" {
+	if fco["output"] != "ok" || fco["call_id"] != callIDs[0] {
 		t.Errorf("tool output 0 = %v", fco)
 	}
 	if got := itemMap(t, items, 6)["output"]; got != "part" {
@@ -581,7 +581,7 @@ func TestFromChatCompletionsEmptyToolArguments(t *testing.T) {
 	var fnItem map[string]any
 	for _, item := range inputItems(t, decodeReq(t, out)) {
 		it := item.(map[string]any)
-		if it["type"] == "function_call" && it["call_id"] == "c9" {
+		if it["type"] == "function_call" && it["name"] == "ping" && markedCallID(it["call_id"]) {
 			fnItem = it
 		}
 	}
@@ -590,6 +590,55 @@ func TestFromChatCompletionsEmptyToolArguments(t *testing.T) {
 	}
 	if fnItem["arguments"] != "{}" || fnItem["name"] != "ping" {
 		t.Fatalf("arguments = %v", fnItem["arguments"])
+	}
+}
+
+// markedCallID reports whether a rewritten call id carries the upstream's
+// external-tool marker (shared.MarkToolCallID); call ids are normalized on
+// every Responses-route source format so reasoning-free replays stay valid.
+func markedCallID(v any) bool {
+	s, ok := v.(string)
+	return ok && strings.HasPrefix(s, "call_") && strings.Contains(s, "_ET_")
+}
+
+// Native Responses passthrough: replayed tool-call ids are marked (the
+// upstream rejects unmarked ids once the turn's reasoning is gone), while a
+// body without tool calls stays byte-identical and marked ids are untouched.
+func TestPassthroughMarksToolCallIDs(t *testing.T) {
+	body := []byte(`{"model":"claude-x","input":[
+		{"role":"user","content":[{"type":"input_text","text":"go"}]},
+		{"type":"function_call","call_id":"call_00_foreign","name":"bash","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_00_foreign","output":"ok"}
+	]}`)
+	out, eErr := BuildRequest("deepseek-v4.1-flash", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	items := inputItems(t, decodeReq(t, out))
+	fc, fco := itemMap(t, items, 1), itemMap(t, items, 2)
+	if !markedCallID(fc["call_id"]) {
+		t.Errorf("function_call id not marked: %v", fc["call_id"])
+	}
+	if fc["call_id"] != fco["call_id"] {
+		t.Errorf("call/output ids diverged: %v vs %v", fc["call_id"], fco["call_id"])
+	}
+
+	marked := []byte(`{"model":"deepseek-v4.1-flash","input":[{"type":"function_call","call_id":"call_01_ET_abcdefghijklmnopqrst","arguments":"{}"}]}`)
+	kept, eErr := BuildRequest("deepseek-v4.1-flash", "openai-response", marked, nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	if string(kept) != string(marked) {
+		t.Errorf("marked body rewritten: %s", kept)
+	}
+
+	plain := []byte(`{"model":"deepseek-v4.1-flash","input":"hello"}`)
+	kept, eErr = BuildRequest("deepseek-v4.1-flash", "openai-response", plain, nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	if string(kept) != string(plain) {
+		t.Errorf("tool-free body rewritten: %s", kept)
 	}
 }
 
