@@ -123,15 +123,151 @@ func TestResponsesSynthesisRouteParity(t *testing.T) {
 	}
 	for _, want := range []string{
 		`response.created`, `response.output_item.added`, `response.output_text.delta`,
-		`response.function_call_arguments.delta`, `"model":"m1"`, `"status":"completed"`,
+		`response.function_call_arguments.delta`, `response.function_call_arguments.done`,
+		`response.output_item.done`, `"model":"m1"`, `"status":"completed"`,
 		`"total_tokens":5`,
 	} {
 		if !strings.Contains(a, want) {
 			t.Errorf("synthesized stream missing %s", want)
 		}
 	}
-	if strings.Count(a, "data: ") != 7 {
-		t.Errorf("event count = %d, want 7 (created, 2 added, text delta, 2 args deltas, completed)",
+	if strings.Count(a, "data: ") != 10 {
+		t.Errorf("event count = %d, want 10 (created, 2 added, text delta, 2 args deltas, args done, 2 item dones, completed)",
 			strings.Count(a, "data: "))
+	}
+}
+
+// orderedEvent is one parsed synthesized SSE frame in emission order.
+type orderedEvent struct {
+	name string
+	data map[string]any
+}
+
+// feedOrderedEvents feeds chunks and returns the synthesized frames in order.
+func feedOrderedEvents(t *testing.T, f feeder, chunks []string) []orderedEvent {
+	t.Helper()
+	var raw strings.Builder
+	for _, c := range chunks {
+		evs, done, eErr := f.Feed([]byte(c))
+		if eErr != nil {
+			t.Fatalf("feed %q: %v", c, eErr)
+		}
+		for _, ev := range evs {
+			raw.Write(ev)
+		}
+		if done {
+			break
+		}
+	}
+	var out []orderedEvent
+	for _, block := range strings.Split(raw.String(), "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				name = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if name == "" || data == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(data), &m); err != nil {
+			t.Fatalf("bad frame payload %q: %v", data, err)
+		}
+		out = append(out, orderedEvent{name: name, data: m})
+	}
+	return out
+}
+
+// Regression pin: a synthesized Responses stream must close the tool-call
+// lifecycle — response.function_call_arguments.done plus
+// response.output_item.done per announced function_call — BEFORE the
+// terminal response.completed. Without the item-done frame a client cannot
+// know the arguments are complete and must reject the whole turn (Pi
+// reported an unfinished tool call for DeepSeek routes served by the Chat
+// Completions adapter).
+func TestResponsesToolLifecycleClosureParity(t *testing.T) {
+	claudeUp := []string{
+		"event: message_start\n" + `data: {"type":"message_start","message":{"id":"resp_1","model":"m1","usage":{"input_tokens":2}}}` + "\n\n",
+		`event: content_block_start` + "\n" + `data: {"index":0,"content_block":{"type":"text"}}` + "\n\n",
+		`event: content_block_delta` + "\n" + `data: {"index":0,"delta":{"type":"text_delta","text":"He"}}` + "\n\n",
+		`event: content_block_start` + "\n" + `data: {"index":1,"content_block":{"type":"tool_use","id":"call_1","name":"f"}}` + "\n\n",
+		`event: content_block_delta` + "\n" + `data: {"index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}` + "\n\n",
+		`event: message_delta` + "\n" + `data: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}` + "\n\n",
+		`event: message_stop` + "\n" + `data: {"type":"message_stop"}` + "\n\n",
+	}
+	ccUp := []string{
+		"data: {\"id\":\"resp_1\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n",
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He\"}}]}\n",
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}}]}}]}\n",
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n",
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n",
+		"data: [DONE]\n",
+	}
+	cases := []struct {
+		name   string
+		f      feeder
+		chunks []string
+	}{
+		{"claude-source", messages.NewStreamConverter("openai-response"), claudeUp},
+		{"chat-completions-source", chatcompletions.NewStreamConverter("openai-response"), ccUp},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			events := feedOrderedEvents(t, tc.f, tc.chunks)
+			announced := map[int]string{}
+			closedAt := map[int]int{}
+			argsDoneAt := map[int]int{}
+			argsDoneValue := map[int]string{}
+			completedAt := -1
+			for i, ev := range events {
+				switch ev.name {
+				case "response.output_item.added":
+					item, _ := ev.data["item"].(map[string]any)
+					announced[int(ev.data["output_index"].(float64))], _ = item["type"].(string)
+				case "response.function_call_arguments.done":
+					idx := int(ev.data["output_index"].(float64))
+					argsDoneAt[idx] = i
+					argsDoneValue[idx], _ = ev.data["arguments"].(string)
+				case "response.output_item.done":
+					closedAt[int(ev.data["output_index"].(float64))] = i
+				case "response.completed":
+					if completedAt >= 0 {
+						t.Fatalf("duplicate response.completed at %d and %d", completedAt, i)
+					}
+					completedAt = i
+				}
+			}
+			if completedAt < 0 {
+				t.Fatal("missing response.completed")
+			}
+			if completedAt != len(events)-1 {
+				t.Fatalf("response.completed must terminate the stream, got event %d of %d", completedAt, len(events))
+			}
+			if len(announced) == 0 {
+				t.Fatal("no output items announced")
+			}
+			for index, kind := range announced {
+				closeAt, closed := closedAt[index]
+				if !closed {
+					t.Errorf("item %d (%s) never closed by output_item.done before completion", index, kind)
+					continue
+				}
+				if kind != "function_call" {
+					continue
+				}
+				argsAt, ok := argsDoneAt[index]
+				if !ok || argsAt > closeAt {
+					t.Errorf("function_call %d missing function_call_arguments.done before output_item.done", index)
+					continue
+				}
+				if want := `{"a":1}`; argsDoneValue[index] != want {
+					t.Errorf("function_call_arguments.done arguments = %q, want %q", argsDoneValue[index], want)
+				}
+			}
+		})
 	}
 }

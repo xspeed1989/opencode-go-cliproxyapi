@@ -3,6 +3,7 @@ package chatcompletions
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -490,8 +491,10 @@ func (sc *StreamConverter) responsesEm() shared.ResponsesEventEmitter {
 	return shared.ResponsesEventEmitter{ID: sc.id, Model: sc.model}
 }
 
-// responsesTerminal renders the held response.completed exactly once,
-// carrying the captured usage when any arrived before emission.
+// responsesTerminal renders the held terminal lifecycle exactly once:
+// every announced output item is closed in output_index order, then the
+// response.completed event carrying the captured usage when any arrived
+// before emission.
 func (sc *StreamConverter) responsesTerminal() [][]byte {
 	finish := sc.heldFinish
 	sc.heldFinish = ""
@@ -539,5 +542,44 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 		}
 	}
 	usage := shared.NewResponsesUsageFrom(input, outputTokens, details)
-	return [][]byte{sc.responsesEm().Completed(status, usage, oa.Render())}
+	events := sc.responsesItemCompletions()
+	return append(events, sc.responsesEm().Completed(status, usage, oa.Render()))
+}
+
+// responsesItemCompletions closes every announced output item in
+// output_index order before the terminal response.completed: the complete
+// function_call arguments (response.function_call_arguments.done) and the
+// item itself (response.output_item.done), plus the aggregated message
+// item. Chat Completions upstreams have no such frame, but Responses
+// clients validate the tool-call lifecycle and refuse a turn whose
+// function_call item never completes, since its arguments may be cut off.
+func (sc *StreamConverter) responsesItemCompletions() [][]byte {
+	em := sc.responsesEm()
+	type pending struct {
+		index int
+		evs   [][]byte
+	}
+	items := make([]pending, 0, len(sc.toolOrder)+1)
+	for _, idx := range sc.toolOrder {
+		t := sc.tools[idx]
+		if t == nil {
+			continue
+		}
+		args := shared.DefaultArgs(t.args.String())
+		items = append(items, pending{t.blockIndex, [][]byte{
+			em.ArgsDone(t.id, t.blockIndex, args),
+			em.ItemDone(t.blockIndex, shared.FunctionCallDoneItem(t.id, t.name, args)),
+		}})
+	}
+	if sc.msgIndex >= 0 {
+		items = append(items, pending{sc.msgIndex, [][]byte{
+			em.ItemDone(sc.msgIndex, shared.MessageDoneItem(sc.id, sc.respText.String())),
+		}})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].index < items[j].index })
+	var out [][]byte
+	for _, p := range items {
+		out = append(out, p.evs...)
+	}
+	return out
 }

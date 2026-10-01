@@ -666,6 +666,39 @@ func (e ResponsesEventEmitter) ArgsDelta(itemID string, outputIndex int, delta s
 	})
 }
 
+// ArgsDone closes the announced function_call item's argument stream with
+// the complete accumulated arguments. Together with ItemDone it completes
+// the tool-call lifecycle: a client that never sees output_item.done cannot
+// know whether arguments were truncated and must reject the turn.
+func (e ResponsesEventEmitter) ArgsDone(itemID string, outputIndex int, arguments string) []byte {
+	return SSEEvent("response.function_call_arguments.done", map[string]any{
+		"type":    "response.function_call_arguments.done",
+		"item_id": itemID, "output_index": outputIndex, "arguments": arguments,
+	})
+}
+
+// ItemDone closes the output item announced at outputIndex. The item is a
+// RespItem so streamed done frames and the terminal completed payload share
+// one canonical shape (FR-006 mode/route parity).
+func (e ResponsesEventEmitter) ItemDone(outputIndex int, item any) []byte {
+	return SSEEvent("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": outputIndex, "item": item,
+	})
+}
+
+// MessageDoneItem renders the canonical aggregated message item: one
+// output_text part carrying every observed text fragment.
+func MessageDoneItem(id, text string) RespItem {
+	content, _ := json.Marshal([]outputTextPart{{Type: "output_text", Text: text}})
+	return RespItem{Type: "message", ID: id, Role: "assistant", Content: content}
+}
+
+// FunctionCallDoneItem renders the canonical call_id-only function_call item
+// (F-R5 shape: no "id" key) with complete accumulated arguments.
+func FunctionCallDoneItem(callID, name, args string) RespItem {
+	return RespItem{Type: "function_call", CallID: callID, Name: name, Arguments: args}
+}
+
 // Completed renders the terminal response.completed event: status from the
 // route's status mapping, usage always attached (F-R6), and output items
 // rendered by the caller through OutputAssembler.
@@ -1451,8 +1484,7 @@ func (a *OutputAssembler) AppendFunctionCall(callID, name, args string) {
 func (a *OutputAssembler) Render() []any {
 	t := a.text.String()
 	if t != "" || a.textSlot >= 0 {
-		content, _ := json.Marshal([]outputTextPart{{Type: "output_text", Text: t}})
-		msg := RespItem{Type: "message", ID: a.messageID, Role: "assistant", Content: content}
+		msg := MessageDoneItem(a.messageID, t)
 		if a.textSlot >= 0 {
 			a.items[a.textSlot] = msg
 		} else {

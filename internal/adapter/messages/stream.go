@@ -314,7 +314,7 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 		sc.captureCache(ev.Usage)
 		sc.stopReason = ev.Delta.StopReason
 	case "message_stop":
-		*events = append(*events, sc.responsesCompleted())
+		*events = append(*events, sc.responsesTerminal()...)
 		return true, nil
 	case "error":
 		return false, sseError(ev.Error)
@@ -335,6 +335,63 @@ func (sc *StreamConverter) responsesCompleted() []byte {
 	usage := shared.NewResponsesUsageFrom(sc.promptTokens+valueOrZero(sc.cacheRead)+valueOrZero(sc.cacheCreation), sc.completionTokens,
 		shared.UsageDetails{CachedTokens: sc.cacheRead, CacheWriteTokens: sc.cacheCreation})
 	return sc.responsesEm().Completed(status, usage, sc.outputItems())
+}
+
+// responsesTerminal renders the held terminal lifecycle exactly once: every
+// announced output item is closed in compacted output_index order, then
+// response.completed. Shared by message_stop and Flush so an early upstream
+// close emits the same lifecycle as the normal path.
+func (sc *StreamConverter) responsesTerminal() [][]byte {
+	return append(sc.responsesItemCompletions(), sc.responsesCompleted())
+}
+
+// responsesItemCompletions closes every announced output item in the
+// compacted output_index space before the terminal response.completed: the
+// complete tool_use arguments (response.function_call_arguments.done) and
+// the item itself (response.output_item.done), plus the single aggregated
+// message item. Clients that validate the tool-call lifecycle (e.g. Pi)
+// refuse a turn whose function_call item never completes, because its
+// arguments may be truncated.
+func (sc *StreamConverter) responsesItemCompletions() [][]byte {
+	em := sc.responsesEm()
+	indexes := make([]int, 0, len(sc.blocks))
+	for i := range sc.blocks {
+		indexes = append(indexes, i)
+	}
+	sort.Ints(indexes)
+	var text strings.Builder
+	for _, i := range indexes {
+		if bs := sc.blocks[i]; bs.kind == "text" {
+			text.WriteString(bs.text.String())
+		}
+	}
+	type pending struct {
+		index int
+		evs   [][]byte
+	}
+	items := make([]pending, 0, len(indexes))
+	if sc.msgIdx >= 0 {
+		items = append(items, pending{sc.msgIdx, [][]byte{
+			em.ItemDone(sc.msgIdx, shared.MessageDoneItem(sc.msgID, text.String())),
+		}})
+	}
+	for _, i := range indexes {
+		bs := sc.blocks[i]
+		if bs.kind != "tool_use" {
+			continue
+		}
+		args := shared.DefaultArgs(bs.args.String())
+		items = append(items, pending{bs.outIdx, [][]byte{
+			em.ArgsDone(bs.id, bs.outIdx, args),
+			em.ItemDone(bs.outIdx, shared.FunctionCallDoneItem(bs.id, bs.name, args)),
+		}})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].index < items[j].index })
+	var out [][]byte
+	for _, p := range items {
+		out = append(out, p.evs...)
+	}
+	return out
 }
 
 // responsesEm binds the shared Responses emitter kernel to the captured
@@ -360,7 +417,7 @@ func (sc *StreamConverter) Flush() [][]byte {
 	}
 	switch sc.sourceFormat {
 	case "openai-response":
-		return [][]byte{sc.responsesCompleted()}
+		return sc.responsesTerminal()
 	case "openai":
 		return nil
 	default: // claude passthrough forwards verbatim; nothing deferred
