@@ -412,24 +412,25 @@ func TestResponsesEffortMapping(t *testing.T) {
 		}
 		return r["effort"]
 	}
-	// nil capability → default ladder low/medium/high.
+	// Response-side budget mapping is the fixed threshold table only:
+	// 8192 → medium, 70000 → xhigh (no capability clamping).
 	if got := effort(build(nil, `{"type":"enabled","budget_tokens":8192}`)); got != "medium" {
-		t.Errorf("nil ts ladder = %v, want medium", got)
+		t.Errorf("budget ladder = %v, want medium", got)
 	}
-	if got := effort(build(nil, `{"type":"enabled","budget_tokens":70000}`)); got != "high" {
-		t.Errorf("nil ts ladder top = %v, want high", got)
+	if got := effort(build(nil, `{"type":"enabled","budget_tokens":70000}`)); got != "xhigh" {
+		t.Errorf("budget ladder top = %v, want xhigh", got)
 	}
-	// ZeroAllowed with "none" declared resolves to "none", which now
-	// forwards verbatim like the CC-upstream leg (no silent upstream
-	// default re-enabling reasoning).
+	// Zero budget renders the off-state "none" and forwards verbatim; the
+	// target's declared capability never re-enables reasoning silently.
 	zeroTS := &pluginapi.ThinkingSupport{ZeroAllowed: true, Levels: []string{"none", "minimal", "low"}}
 	if got := effort(build(zeroTS, `{"type":"enabled","budget_tokens":0}`)); got != "none" {
 		t.Errorf("declared none budget = %v, want forwarded none", got)
 	}
-	// DynamicAllowed yields the "auto" sentinel; also omitted here.
+	// Capability metadata is ignored: zero budget stays "none" even when
+	// the model declares a dynamic sentinel.
 	dynTS := &pluginapi.ThinkingSupport{DynamicAllowed: true, Levels: []string{"low", "medium", "high"}}
-	if got := effort(build(dynTS, `{"type":"enabled","budget_tokens":0}`)); got != nil {
-		t.Errorf("auto sentinel must omit reasoning entirely, got %v", got)
+	if got := effort(build(dynTS, `{"type":"enabled","budget_tokens":0}`)); got != "none" {
+		t.Errorf("zero budget with dynamic capability = %v, want none", got)
 	}
 	// Disabled thinking produces no reasoning block.
 	m := build(nil, `{"type":"disabled","budget_tokens":2048}`)
@@ -668,37 +669,42 @@ func TestFromChatCompletionsImageInToolContentRejected(t *testing.T) {
 	}
 }
 
-// reasoning_effort is capability-gated like the reverse Responses→CC leg:
-// unsupported levels fail descriptively, supported ones forward normalized.
-func TestFromChatCompletionsEffortCapability(t *testing.T) {
-	body := []byte(`{"messages":[],"reasoning_effort":" XHIGH "}`)
-	if _, eErr := BuildRequest("m", "openai", body, nil); eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Fatalf("unsupported effort = %v, want ClassUnsupported", eErr)
+// reasoning_effort is forwarded exactly, without a capability gate or
+// normalization of the client-provided value.
+func TestFromChatCompletionsEffortPassthrough(t *testing.T) {
+	for _, effort := range []string{"xhigh", "max", "ultra", "none", "auto"} {
+		body := []byte(`{"messages":[],"reasoning_effort":"` + effort + `"}`)
+		m := decodeReq(t, mustBuild(t, "m", "openai", body, nil))
+		r, ok := m["reasoning"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s must forward reasoning: %v", effort, m)
+		}
+		if r["effort"] != effort {
+			t.Fatalf("%s effort = %v", effort, r["effort"])
+		}
 	}
-	ts := &pluginapi.ThinkingSupport{Levels: []string{"low", "high", "xhigh"}}
-	m := decodeReq(t, mustBuild(t, "m", "openai", body, ts))
-	r := m["reasoning"].(map[string]any)
-	if r["effort"] != "xhigh" {
-		t.Fatalf("supported effort = %v, want xhigh", r)
+
+	m := decodeReq(t, mustBuild(t, "m", "openai",
+		[]byte(`{"messages":[],"reasoning_effort":" XHIGH "}`), nil))
+	if r := m["reasoning"].(map[string]any); r["effort"] != " XHIGH " {
+		t.Fatalf("effort changed: %q", r["effort"])
 	}
 }
 
-// Sentinels are capability-gated: a "none" the model does not declare and
-// the dynamic "auto" sentinel are omitted — Responses has no off-switch, so
-// omission is the no-forced-reasoning policy (matches the Messages-target
-// leg); declared levels forward.
-func TestFromChatCompletionsEffortSentinelsOmitted(t *testing.T) {
+// Sentinels are forwarded like every other declared level: the plugin never
+// rewrites a client control to match local capability metadata.
+func TestFromChatCompletionsEffortSentinelsForwarded(t *testing.T) {
 	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true}
 	m := decodeReq(t, mustBuild(t, "m", "openai",
 		[]byte(`{"messages":[],"reasoning_effort":"none"}`), ts))
-	if _, has := m["reasoning"]; has {
-		t.Fatalf("none must omit reasoning: %v", m["reasoning"])
+	if r, has := m["reasoning"].(map[string]any); !has || r["effort"] != "none" {
+		t.Fatalf("none must forward verbatim: %v", m["reasoning"])
 	}
 
 	m = decodeReq(t, mustBuild(t, "m", "openai",
 		[]byte(`{"messages":[],"reasoning_effort":"auto"}`), ts))
-	if _, has := m["reasoning"]; has {
-		t.Fatalf("auto must omit reasoning: %v", m["reasoning"])
+	if r, has := m["reasoning"].(map[string]any); !has || r["effort"] != "auto" {
+		t.Fatalf("auto must forward verbatim: %v", m["reasoning"])
 	}
 
 	tsHigh := &pluginapi.ThinkingSupport{Levels: []string{"low", "high"}}
@@ -709,11 +715,7 @@ func TestFromChatCompletionsEffortSentinelsOmitted(t *testing.T) {
 	}
 }
 
-// A validated effort "none" forwards verbatim when the model declares it
-// (either via ZeroAllowed+Levels or Levels alone), matching the CC-upstream
-// leg which forwards the identical validated value as-is (FR-005
-// no-silent-loss). The undeclared case stays pinned by
-// TestFromChatCompletionsEffortSentinelsOmitted.
+// Capability metadata must not rewrite a declared off-state value either.
 func TestFromChatCompletionsEffortNoneDeclaredForwarded(t *testing.T) {
 	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, Levels: []string{"none", "low"}}
 	m := decodeReq(t, mustBuild(t, "m", "openai",
@@ -725,7 +727,7 @@ func TestFromChatCompletionsEffortNoneDeclaredForwarded(t *testing.T) {
 	tsLevel := &pluginapi.ThinkingSupport{Levels: []string{"none", "high"}}
 	m = decodeReq(t, mustBuild(t, "m", "openai",
 		[]byte(`{"messages":[],"reasoning_effort":" NONE "}`), tsLevel))
-	if r := m["reasoning"].(map[string]any); r["effort"] != "none" {
-		t.Fatalf("level-declared none = %v, want normalized forward", r)
+	if r := m["reasoning"].(map[string]any); r["effort"] != " NONE " {
+		t.Fatalf("level-declared none changed: %q", r["effort"])
 	}
 }

@@ -1115,3 +1115,59 @@ func TestRefreshDataKeyAbsentVsEmpty(t *testing.T) {
 		t.Fatalf("intended clear must stay silent, got %v", got)
 	}
 }
+
+// Catalogs may publish supported_reasoning_levels without a thinking
+// object. Expose those declarations as metadata; request acceptance does
+// not depend on this catalog representation.
+func TestReasoningLevelsListMapped(t *testing.T) {
+	body := `{"data":[
+		{"id":"deepseek-v4.1-flash","supported_reasoning_levels":[
+			{"description":"lighter","effort":"low"},
+			{"description":"balanced","effort":"medium"},
+			{"description":"deeper","effort":"high"},
+			{"description":"extra","effort":"xhigh"}]},
+		{"id":"glm-5.2"}
+	]}`
+	fc := &fakeClient{resp: pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(body)}}
+	m := newManager(testCfg(), fc)
+	mustRefresh(t, m)
+
+	rec := findModel(t, m.Models(), "deepseek-v4.1-flash")
+	if rec.Thinking == nil {
+		t.Fatalf("declared reasoning levels dropped: %+v", rec)
+	}
+	want := []string{"low", "medium", "high", "xhigh"}
+	if !reflect.DeepEqual(rec.Thinking.Levels, want) {
+		t.Fatalf("Levels = %v, want %v", rec.Thinking.Levels, want)
+	}
+
+	// Missing metadata must stay absent rather than inventing levels.
+	if bare := findModel(t, m.Models(), "glm-5.2"); bare.Thinking != nil {
+		t.Fatalf("absent reasoning metadata must stay nil: %+v", bare.Thinking)
+	}
+}
+
+// Both capability shapes merge into one level set: declared thinking levels
+// first, then list efforts, de-duplicated case-insensitively, blanks
+// dropped, with the other thinking fields preserved.
+func TestReasoningMapAndDeclarationMerge(t *testing.T) {
+	body := `{"data":[
+		{"id":"glm-merged","thinking":{"min":1024,"max":32768,"levels":["Low","high"]},
+		 "supported_reasoning_levels":[{"effort":"high"},{"effort":" XHIGH "},{"effort":""}]}
+	]}`
+	fc := &fakeClient{resp: pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(body)}}
+	m := newManager(testCfg(), fc)
+	mustRefresh(t, m)
+
+	rec := findModel(t, m.Models(), "glm-merged")
+	if rec.Thinking == nil {
+		t.Fatal("merged capability missing")
+	}
+	want := []string{"Low", "high", "XHIGH"}
+	if !reflect.DeepEqual(rec.Thinking.Levels, want) {
+		t.Fatalf("Levels = %v, want %v", rec.Thinking.Levels, want)
+	}
+	if rec.Thinking.Min != 1024 || rec.Thinking.Max != 32768 {
+		t.Fatalf("bounds lost: min=%d max=%d", rec.Thinking.Min, rec.Thinking.Max)
+	}
+}

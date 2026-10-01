@@ -12,7 +12,6 @@ package responses
 import (
 	"encoding/json"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -30,9 +29,9 @@ var EndpointPath = catalog.RouteResponses.EndpointPath()
 // ("openai" Chat Completions, "claude" Anthropic Messages,
 // "openai-response" native Responses passthrough) into a Responses body
 // for upstreamModel (FR-005, AC §D). upstreamModel replaces whatever
-// client-facing model ID the request carried (FR-003). ts is the target
-// model's declared reasoning capability and drives budget→effort mapping
-// via the shared thinking package; nil falls back to the default ladder.
+// client-facing model ID the request carried (FR-003). Declared efforts
+// pass through unchanged, regardless of ts. Anthropic budgets use a fixed
+// threshold conversion only when no explicit effort is provided.
 // Unknown formats are ClassUnsupported; malformed input is
 // ClassTranslation; messages are descriptive and redacted.
 func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
@@ -130,8 +129,8 @@ func contentParts(raw json.RawMessage, role string) ([]map[string]any, *errclass
 // replaying output_text), tool_calls history becomes function_call items,
 // tool results become function_call_output items, max_tokens/
 // max_completion_tokens become max_output_tokens, and reasoning_effort is
-// capability-checked against ts and rejected descriptively when the model
-// cannot represent it (matching the reverse Responses→CC leg).
+// forwarded verbatim (no capability filtering: the upstream owns level
+// acceptance).
 // tool_choice is decoded by the shared classifier and rendered into the
 // Responses wire values ("auto"/"none"/"required", flat
 // {type:function,name} for a forced tool); parallel_tool_calls passes
@@ -142,7 +141,10 @@ func contentParts(raw json.RawMessage, role string) ([]map[string]any, *errclass
 // equivalent (logprobs, frequency_penalty, presence_penalty, n, seed,
 // response_format, logit_bias) via struct selection. Tool calls and
 // reasoning controls are never dropped silently.
-func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+//
+// ts is accepted for the executor's uniform adapter fan-out and is
+// intentionally ignored here: declared levels pass through untouched.
+func fromChatCompletions(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	var src shared.ChatCompletionsRequest
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, errclass.Translation("malformed openai request JSON: " + err.Error())
@@ -165,15 +167,7 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 		req.MaxOutputTokens = src.MaxCompletionTokens
 	}
 	if src.ReasoningEffort != "" {
-		if eErr := thinking.ValidateEffort(src.ReasoningEffort, ts); eErr != nil {
-			return nil, eErr
-		}
-		// The dynamic "auto" sentinel omits reasoning via the shared policy
-		// below; a declared "none" and every other validated value forward
-		// as-is (matching the CC-upstream leg).
-		if effort, ok := reasoningEffortFor(strings.ToLower(strings.TrimSpace(src.ReasoningEffort)), ts); ok {
-			req.Reasoning = map[string]any{"effort": effort}
-		}
+		req.Reasoning = map[string]any{"effort": src.ReasoningEffort}
 	}
 
 	var instr strings.Builder
@@ -261,39 +255,12 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 
 // ---- Claude Messages source --------------------------------------------
 
-// reasoningEffortFor is the single off-state policy for the Responses
-// target (FR-005), applied to an already-resolved effort value from both
-// source legs. The dynamic "auto" sentinel has no wire representation here,
-// so the reasoning field is omitted entirely (no dynamic sentinel on the
-// Responses wire). "none" forwards verbatim when the model declares it via
-// SupportedLevels — the same admission thinking.ValidateEffort applies and
-// matching the CC-upstream leg which forwards the validated value as-is;
-// when "none" is not declared there is nothing to express, so the field is
-// omitted rather than clamped to the weakest representable level. Every
-// other validated level forwards as-is.
-func reasoningEffortFor(effort string, ts *pluginapi.ThinkingSupport) (string, bool) {
-	switch {
-	case effort == "auto":
-		return "", false
-	case effort == "none":
-		if slices.Contains(thinking.SupportedLevels(ts), "none") {
-			return effort, true
-		}
-		return "", false
-	default:
-		return effort, true
-	}
-}
-
 // fromClaudeMessages translates an Anthropic Messages request into a
 // Responses request (FR-005, AC §D): system becomes instructions, text/
 // image blocks become input parts, tool_use/tool_result become
 // function_call/function_call_output items, an enabled thinking budget
-// maps to reasoning.effort through reasoningEffortFor (the "auto" sentinel
-// and an undeclared "none" omit the field entirely; a declared "none"
-// forwards), max_tokens becomes max_output_tokens (defaulted by the
-// shared kernel, FR-005). Decoding is owned entirely by the shared
-// Claude-request kernel; only target-shape rendering stays local.
+// maps to reasoning.effort (the Anthropic budget renders its canonical
+// table level; capability filtering stays with the upstream).
 //
 // Explicit omission policy (FR-005 "where compatible"): stop_sequences is
 // dropped (no Responses equivalent); thinking/redacted_thinking blocks are
@@ -303,7 +270,7 @@ func reasoningEffortFor(effort string, ts *pluginapi.ThinkingSupport) (string, b
 // silently lost (FR-005). The tool_result is_error flag has no Responses
 // field and is preserved as an "[error] " marker in the output text rather
 // than lost silently.
-func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+func fromClaudeMessages(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	src, eErr := shared.DecodeClaudeMessages(body)
 	if eErr != nil {
 		return nil, eErr
@@ -316,10 +283,10 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 		TopP:            src.TopP,
 	}
 	req.ToolChoice = respToolChoice(src.ToolChoiceKind, src.ToolChoiceName)
-	if shared.ThinkingEnabled(src.Thinking) {
-		if effort, ok := reasoningEffortFor(thinking.EffortFromBudget(src.Thinking.BudgetTokens, ts), ts); ok {
-			req.Reasoning = map[string]any{"effort": effort}
-		}
+	if src.OutputConfig != nil && src.OutputConfig.Effort != "" {
+		req.Reasoning = map[string]any{"effort": src.OutputConfig.Effort}
+	} else if shared.ThinkingEnabled(src.Thinking) {
+		req.Reasoning = map[string]any{"effort": thinking.EffortFromBudget(src.Thinking.BudgetTokens)}
 	}
 	req.Instructions = src.System
 

@@ -30,11 +30,10 @@ func AuthHeaders(key string) http.Header {
 // BuildRequest translates an inbound request body from sourceFormat
 // ("openai" Chat Completions, "openai-response" Responses, "claude"
 // Messages) into a Chat Completions body for upstreamModel (FR-005).
-// ts carries the target model's thinking capability so reasoning
-// budgets map to a supported effort level instead of being silently
-// degraded (FR-005). Unknown formats are ClassUnsupported; malformed
-// input is ClassTranslation. Errors are descriptive and redacted — no
-// silent loss of tools or reasoning controls.
+// Declared efforts pass through unchanged; capability metadata is not used
+// to validate or rewrite them. Anthropic budgets use a fixed threshold
+// conversion only when no explicit effort is provided. Unknown formats are
+// ClassUnsupported; malformed input is ClassTranslation.
 func BuildRequest(upstreamModel, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	switch sourceFormat {
 	case "openai":
@@ -164,10 +163,10 @@ type claudeBlock = map[string]any
 // assistant tool_calls, tool_result blocks become role:"tool" messages,
 // max_tokens/stop_sequences/tools map to their CC equivalents
 // (max_tokens defaulted by the shared kernel, FR-005), and the thinking
-// budget maps to a capability-aware reasoning_effort via
-// thinking.EffortFromBudget. Decoding is owned entirely by the shared
+// budget maps to a reasoning_effort through the fixed host table
+// (thinking.EffortFromBudget). Decoding is owned entirely by the shared
 // Claude-request kernel; only target-shape rendering stays local.
-func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+func claudeToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	src, eErr := shared.DecodeClaudeMessages(body)
 	if eErr != nil {
 		return nil, eErr
@@ -182,8 +181,10 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 	if len(src.StopSequences) > 0 {
 		out.Stop = src.StopSequences
 	}
-	if shared.ThinkingEnabled(src.Thinking) {
-		out.ReasoningEffort = thinking.EffortFromBudget(src.Thinking.BudgetTokens, ts)
+	if src.OutputConfig != nil && src.OutputConfig.Effort != "" {
+		out.ReasoningEffort = src.OutputConfig.Effort
+	} else if shared.ThinkingEnabled(src.Thinking) {
+		out.ReasoningEffort = thinking.EffortFromBudget(src.Thinking.BudgetTokens)
 	}
 	applyToolChoiceCC(out, src.ToolChoiceKind, src.ToolChoiceName)
 	if src.System != "" {
@@ -320,12 +321,13 @@ func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclas
 // Completions request (FR-005): instructions and system items become
 // system messages, message items map by role, function_call items merge
 // into assistant tool_calls, function_call_output items become role:"tool"
-// messages, reasoning.effort maps to reasoning_effort,
+// messages, reasoning.effort maps to reasoning_effort verbatim (declared
+// levels are never re-ranked or rejected locally),
 // parallel_tool_calls passes through as-is (the reverse leg forwards the
 // same field), and max_output_tokens maps to max_tokens. Historical
 // reasoning items are omitted (no CC equivalent; FR-005 explicit omission
 // policy).
-func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	var src shared.ResponsesRequest
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, errclass.Translation("malformed openai-response request JSON: " + err.Error())
@@ -341,10 +343,7 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 		out.MaxTokens = src.MaxOutputTokens
 	}
 	if src.Reasoning != nil && src.Reasoning.Effort != "" {
-		if eErr := thinking.ValidateEffort(src.Reasoning.Effort, ts); eErr != nil {
-			return nil, eErr
-		}
-		out.ReasoningEffort = strings.ToLower(strings.TrimSpace(src.Reasoning.Effort))
+		out.ReasoningEffort = src.Reasoning.Effort
 	}
 	kind, tcName, eErr := shared.DecodeToolChoice(src.ToolChoice)
 	if eErr != nil {

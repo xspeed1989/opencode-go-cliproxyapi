@@ -222,108 +222,39 @@ func TestChatCompletionsDataURLImage(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsThinkingBudget(t *testing.T) {
-	// Rank-based budget within [Min, Max] for a capability-aware ts.
-	ts := &pluginapi.ThinkingSupport{Min: 1024, Max: 32000, Levels: []string{"low", "medium", "high"}}
-	for _, effort := range []string{"low", "medium", "high"} {
-		m, eErr := chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"`+effort+`"}`)
+func TestChatCompletionsEffortPreservesEnvelope(t *testing.T) {
+	ts := &pluginapi.ThinkingSupport{Min: 4096, Max: 8192, Levels: []string{"low"}}
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max", "none", "auto", " Custom-Tier "} {
+		body := fmt.Sprintf(`{"messages":[{"role":"user","content":"a"}],"reasoning_effort":%q,"temperature":0.5,"top_p":0.9,"max_tokens":7777}`, effort)
+		m, eErr := chatReqTS(t, ts, body)
 		if eErr != nil {
-			t.Fatalf("%s: unexpected error: %v", effort, eErr)
+			t.Fatalf("%q: unexpected error: %v", effort, eErr)
 		}
-		th := m["thinking"].(map[string]any)
-		budget := th["budget_tokens"].(float64)
-		if th["type"] != "enabled" || budget < float64(ts.Min) || budget > float64(ts.Max) {
-			t.Errorf("%s thinking = %v (want enabled, [%d,%d])", effort, th, ts.Min, ts.Max)
+		if output, _ := m["output_config"].(map[string]any); output["effort"] != effort {
+			t.Errorf("effort = %v, want exact value %q", output, effort)
 		}
-		if _, ok := m["temperature"]; ok {
-			t.Errorf("%s temperature must be dropped with thinking", effort)
+		if _, inferred := m["thinking"]; inferred {
+			t.Errorf("%q: effort must not infer a thinking budget", effort)
 		}
-	}
-	// Table semantics: high → exact levelToBudgetMap value 24576, inside
-	// [Min,Max] so no clamping applies.
-	m, eErr := chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"high"}`)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
-	}
-	if m["thinking"].(map[string]any)["budget_tokens"] != float64(24576) {
-		t.Errorf("high budget = %v", m["thinking"])
-	}
-
-	// xhigh/max accepted when the model declares them.
-	declared := &pluginapi.ThinkingSupport{Max: 32000, Levels: []string{"minimal", "low", "medium", "high", "xhigh", "max"}}
-	for _, effort := range []string{"xhigh", "max"} {
-		m, eErr := chatReqTS(t, declared, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"`+effort+`"}`)
-		if eErr != nil {
-			t.Fatalf("%s declared: unexpected error: %v", effort, eErr)
+		if m["temperature"] != 0.5 || m["top_p"] != 0.9 || m["max_tokens"] != float64(7777) {
+			t.Errorf("%q: effort changed sampling or output limit: %v", effort, m)
 		}
-		if m["thinking"] == nil {
-			t.Errorf("%s declared: thinking missing", effort)
-		}
-	}
-
-	// nil ts defaults to low/medium/high with exact table values.
-	for effort, want := range map[string]int64{"low": 1024, "high": 24576} {
-		m, eErr := chatReq(t, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"`+effort+`"}`)
-		if eErr != nil {
-			t.Fatalf("%s default: unexpected error: %v", effort, eErr)
-		}
-		if got := m["thinking"].(map[string]any)["budget_tokens"]; got != float64(want) {
-			t.Errorf("%s default budget = %v, want %d", effort, got, want)
-		}
-	}
-
-	// budget clamped above max_tokens: high → 24576, so the 4096 default
-	// must be raised to budget+1024.
-	m, eErr = chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"high"}`)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
-	}
-	if m["max_tokens"].(float64) != float64(24576+1024) {
-		t.Errorf("max_tokens not raised above budget: %v", m["max_tokens"])
 	}
 }
 
-func TestChatCompletionsThinkingNoneAndAuto(t *testing.T) {
-	// "none" with ZeroAllowed resolves to 0: no thinking block, sampling kept.
-	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true}
-	m, eErr := chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"none","temperature":0.5}`)
+func TestChatCompletionsAbsentEffort(t *testing.T) {
+	m, eErr := chatReq(t, `{"messages":[{"role":"user","content":"a"}],"temperature":0.5}`)
 	if eErr != nil {
 		t.Fatalf("unexpected error: %v", eErr)
 	}
-	if _, ok := m["thinking"]; ok {
-		t.Errorf("thinking must be omitted for zero budget: %v", m["thinking"])
+	if _, inferred := m["output_config"]; inferred {
+		t.Errorf("missing effort must not be inferred: %v", m["output_config"])
+	}
+	if _, inferred := m["thinking"]; inferred {
+		t.Errorf("missing effort must not infer thinking: %v", m["thinking"])
 	}
 	if m["temperature"] != 0.5 {
-		t.Errorf("sampling controls must survive zero budget: %v", m["temperature"])
-	}
-
-	// dynamic "auto" has no Anthropic sentinel: omitted, sampling kept.
-	m, eErr = chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"auto","temperature":0.5}`)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
-	}
-	if _, ok := m["thinking"]; ok {
-		t.Errorf("dynamic auto must omit thinking: %v", m["thinking"])
-	}
-	if m["temperature"] != 0.5 {
-		t.Errorf("sampling controls must survive auto: %v", m["temperature"])
-	}
-}
-
-// F6 regression: with ZeroAllowed AND Min>0, effort "none" must stay at the
-// zero off-sentinel — the Min clamp must not silently re-enable thinking
-// (FR-005).
-func TestChatCompletionsThinkingNoneIgnoresMin(t *testing.T) {
-	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, Min: 2048}
-	m, eErr := chatReqTS(t, ts, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"none","temperature":0.5,"top_p":0.9}`)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
-	}
-	if _, ok := m["thinking"]; ok {
-		t.Errorf("effort none must not produce a thinking block despite Min: %v", m["thinking"])
-	}
-	if m["temperature"] != 0.5 || m["top_p"] != 0.9 {
-		t.Errorf("sampling controls must survive effort none: temperature=%v top_p=%v", m["temperature"], m["top_p"])
+		t.Errorf("sampling must survive missing effort: %v", m["temperature"])
 	}
 }
 
@@ -461,9 +392,11 @@ func TestResponsesItems(t *testing.T) {
 	if th["type"] != "thinking" || th["thinking"] != "thought A\nthought B" {
 		t.Errorf("reasoning block = %v", th)
 	}
-	thb := m["thinking"].(map[string]any)
-	if thb["budget_tokens"] != float64(1024) { // nil ts: low → lowest anchor
-		t.Errorf("thinking budget = %v", thb)
+	if output, _ := m["output_config"].(map[string]any); output["effort"] != "low" {
+		t.Errorf("reasoning effort changed: %v", output)
+	}
+	if _, inferred := m["thinking"]; inferred {
+		t.Error("explicit effort must not infer a thinking budget")
 	}
 	tool := m["tools"].([]any)[0].(map[string]any)
 	if tool["name"] != "f" || tool["description"] != "fd" {
@@ -517,14 +450,15 @@ func TestChatCompletionsEmptyArgsToolImagesDefaultSchema(t *testing.T) {
 }
 
 func TestChatCompletionsUnknownEffort(t *testing.T) {
-	_, eErr := chatReq(t, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"maximum"}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Fatalf("want ClassUnsupported, got %+v", eErr)
-	}
-	// undeclared canonical levels are rejected explicitly too (FR-005).
-	_, eErr = chatReq(t, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"max"}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Fatalf("undeclared max: want ClassUnsupported, got %+v", eErr)
+	for _, effort := range []string{"maximum", "max"} {
+		body := `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"` + effort + `"}`
+		m, eErr := chatReq(t, body)
+		if eErr != nil {
+			t.Fatalf("%q: plugin must not reject effort: %v", effort, eErr)
+		}
+		if output, _ := m["output_config"].(map[string]any); output["effort"] != effort {
+			t.Fatalf("%q: effort was lost or rewritten: %v", effort, output)
+		}
 	}
 }
 

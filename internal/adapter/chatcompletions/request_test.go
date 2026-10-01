@@ -225,24 +225,23 @@ func TestBuildRequest_OpenAISanitizeThinking(t *testing.T) {
 // capability-aware (FR-005): tiers beyond the static low/medium/high
 // buckets survive when the model declares them.
 func TestBuildRequestThinkingEffort(t *testing.T) {
+	// Budget→effort is the fixed host table only: later levels are derived
+	// from thresholds, never clamped to the target's declared capability.
 	cases := []struct {
 		name   string
 		ts     *pluginapi.ThinkingSupport
 		budget int64
 		want   string
 	}{
-		{"nil ts small budget anchors low", nil, 1024, "low"},
-		{"nil ts mid budget anchors medium", nil, 8192, "medium"},
-		{"nil ts unknown huge budget anchors high", nil, 131072, "high"},
-		{"declared xhigh tier preserved", &pluginapi.ThinkingSupport{
-			Levels: []string{"low", "medium", "high", "xhigh"}, Max: 64000,
+		{"small budget anchors low", nil, 1024, "low"},
+		{"mid budget anchors medium", nil, 8192, "medium"},
+		{"huge budget anchors xhigh", nil, 131072, "xhigh"},
+		{"declared levels do not clamp the derivation", &pluginapi.ThinkingSupport{
+			Levels: []string{"low", "medium", "high"}, Max: 64000,
 		}, 60000, "xhigh"},
-		{"zero allowed picks none", &pluginapi.ThinkingSupport{
-			ZeroAllowed: true, Levels: []string{"none", "low", "high"},
-		}, 0, "none"},
-		{"zero allowed without none falls to lowest", &pluginapi.ThinkingSupport{
+		{"off state renders none", &pluginapi.ThinkingSupport{
 			ZeroAllowed: true, Levels: []string{"low", "high"},
-		}, 0, "low"},
+		}, 0, "none"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -524,7 +523,7 @@ func TestBuildRequestResponses(t *testing.T) {
 		"reasoning":{"effort":"HIGH"}
 	}`
 	m := mustBuild(t, "openai-response", body, nil)
-	if m["max_tokens"] != float64(99) || m["reasoning_effort"] != "high" || m["temperature"] != 0.7 {
+	if m["max_tokens"] != float64(99) || m["reasoning_effort"] != "HIGH" || m["temperature"] != 0.7 {
 		t.Fatalf("envelope fields wrong: %v", m)
 	}
 	msgs := m["messages"].([]any)
@@ -691,25 +690,20 @@ func TestBuildRequestResponsesErrors(t *testing.T) {
 	}
 }
 
-func TestResponsesReasoningEffortValidated(t *testing.T) {
-	// ts nil → default levels {low,medium,high}: unsupported value rejected
-	// naming it; a supported level forwards verbatim.
-	_, eErr := BuildRequest("m", "openai-response",
-		[]byte(`{"reasoning":{"effort":"xhigh"},"input":"hi"}`), nil)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
-		!strings.Contains(eErr.Message, `"xhigh"`) {
-		t.Fatalf("unsupported effort err = %+v", eErr)
-	}
-	out := mustBuild(t, "openai-response", `{"reasoning":{"effort":"high"},"input":"hi"}`, nil)
-	if out["reasoning_effort"] != "high" {
-		t.Fatalf("supported effort = %v", out["reasoning_effort"])
-	}
-
-	// ts declaring xhigh admits it.
-	ts := &pluginapi.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}
-	out = mustBuild(t, "openai-response", `{"reasoning":{"effort":"XHigh"},"input":"hi"}`, ts)
+func TestResponsesReasoningEffortPassthrough(t *testing.T) {
+	// Preserve every declared effort exactly, including case and spaces;
+	// acceptance belongs to the upstream, not local capability metadata.
+	out := mustBuild(t, "openai-response", `{"reasoning":{"effort":"xhigh"},"input":"hi"}`, nil)
 	if out["reasoning_effort"] != "xhigh" {
-		t.Fatalf("capability-aware effort = %v", out["reasoning_effort"])
+		t.Fatalf("xhigh effort = %v", out["reasoning_effort"])
+	}
+	out = mustBuild(t, "openai-response", `{"reasoning":{"effort":"  XHigh "},"input":"hi"}`, nil)
+	if out["reasoning_effort"] != "  XHigh " {
+		t.Fatalf("effort changed: %q", out["reasoning_effort"])
+	}
+	out = mustBuild(t, "openai-response", `{"reasoning":{"effort":"ultra"},"input":"hi"}`, nil)
+	if out["reasoning_effort"] != "ultra" {
+		t.Fatalf("non-canonical effort must pass through: %v", out["reasoning_effort"])
 	}
 }
 
@@ -860,4 +854,3 @@ func TestBuildOpenAIRequestDeveloperRole(t *testing.T) {
 		t.Fatalf("expected role %q, got %q", "system", got)
 	}
 }
-

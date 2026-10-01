@@ -9,7 +9,6 @@ import (
 
 	"opencode-go-cliproxyapi/internal/adapter/shared"
 	"opencode-go-cliproxyapi/internal/errclass"
-	"opencode-go-cliproxyapi/internal/thinking"
 )
 
 type anthropicBlock = map[string]any
@@ -33,24 +32,24 @@ type anthropicTool struct {
 // divergent from shared.ClaudeTool decode type: typed stop sequences +
 // named items vs raw-ignore + tool_choice.
 type messagesRequest struct {
-	Model         string                 `json:"model"`
-	MaxTokens     int64                  `json:"max_tokens"`
-	System        any                    `json:"system,omitempty"` // string or []anthropicBlock
-	Messages      []anthropicMessage     `json:"messages"`
-	StopSequences []string               `json:"stop_sequences,omitempty"`
-	Tools         []anthropicTool        `json:"tools,omitempty"`
-	ToolChoice    any                    `json:"tool_choice,omitempty"` // {type,name?,disable_parallel_tool_use?}
-	Thinking      *shared.ClaudeThinking `json:"thinking,omitempty"`
-	Stream        bool                   `json:"stream,omitempty"`
-	Temperature   *float64               `json:"temperature,omitempty"`
-	TopP          *float64               `json:"top_p,omitempty"`
+	Model         string                     `json:"model"`
+	MaxTokens     int64                      `json:"max_tokens"`
+	System        any                        `json:"system,omitempty"` // string or []anthropicBlock
+	Messages      []anthropicMessage         `json:"messages"`
+	StopSequences []string                   `json:"stop_sequences,omitempty"`
+	Tools         []anthropicTool            `json:"tools,omitempty"`
+	ToolChoice    any                        `json:"tool_choice,omitempty"` // {type,name?,disable_parallel_tool_use?}
+	OutputConfig  *shared.ClaudeOutputConfig `json:"output_config,omitempty"`
+	Stream        bool                       `json:"stream,omitempty"`
+	Temperature   *float64                   `json:"temperature,omitempty"`
+	TopP          *float64                   `json:"top_p,omitempty"`
 }
 
 // BuildRequest translates an inbound request body from sourceFormat
 // ("openai" Chat Completions, "openai-response" Responses, "claude"
 // passthrough) into an Anthropic Messages body for upstreamModel
-// (FR-005). ts carries the target model's thinking capability so
-// reasoning controls resolve against what the model actually supports.
+// (FR-005). Declared efforts map unchanged to output_config.effort;
+// capability metadata does not validate them or infer a thinking budget.
 // Unknown formats are ClassUnsupported; malformed input is
 // ClassTranslation. Errors are descriptive and redacted — no silent loss.
 func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
@@ -149,43 +148,19 @@ func (b *msgBuilder) flush() {
 	b.curKey = ""
 }
 
-// finalize assembles the shared envelope fields, resolves the client
-// reasoning effort to a thinking budget via the model's declared
-// capability (FR-005: unsupported levels are rejected explicitly, never
-// dropped), and encodes the request.
-func finalize(req *messagesRequest, system []string, effort string, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+// finalize renders declared effort using Anthropic's output_config.effort.
+// Preserve the exact value, including unknown levels, and let the upstream
+// decide whether it is valid. Do not infer budgets or adjust sampling.
+func finalize(req *messagesRequest, system []string, effort string, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	req.System = systemField(system)
 	if req.Messages == nil {
 		req.Messages = []anthropicMessage{}
 	}
 	if effort != "" {
-		if eErr := thinking.ValidateEffort(effort, ts); eErr != nil {
-			return nil, eErr
-		}
-		budget, _ := thinking.BudgetFromEffort(effort, ts)
-		applyThinking(req, budget)
+		req.OutputConfig = &shared.ClaudeOutputConfig{Effort: effort}
 	}
 	b, _ := json.Marshal(req) // only marshallable composed types; cannot fail
 	return b, nil
-}
-
-// applyThinking maps a resolved budget onto the Messages thinking field.
-// budget == 0 means reasoning off (ZeroAllowed): no thinking block, and
-// sampling controls stay intact. budget < 0 is the dynamic "auto"
-// sentinel; Anthropic has no dynamic budget field — an adaptive mode
-// would need a catalog-declared capability signal, which does not exist
-// today — so it is omitted rather than fabricated (FR-005 explicit
-// omission policy). budget > 0 enables thinking and drops sampling
-// controls, which Anthropic rejects alongside thinking.
-func applyThinking(req *messagesRequest, budget int64) {
-	if budget <= 0 {
-		return
-	}
-	req.Thinking = &shared.ClaudeThinking{Type: "enabled", BudgetTokens: budget}
-	req.Temperature, req.TopP = nil, nil
-	if req.MaxTokens <= budget {
-		req.MaxTokens = budget + 1024 // budget_tokens must be < max_tokens
-	}
 }
 
 // fromChatCompletions translates a Chat Completions request into a
@@ -193,7 +168,7 @@ func applyThinking(req *messagesRequest, budget int64) {
 // become the top-level system field, assistant tool_calls become tool_use
 // blocks, tool results become user tool_result blocks, stop becomes
 // stop_sequences, tools become input_schema definitions, reasoning_effort
-// becomes a best-effort thinking budget.
+// passes through unchanged as output_config.effort.
 //
 // Explicit omission policy (FR-005): fields with no Messages equivalent
 // (logprobs, frequency_penalty, n, ...) are omitted by struct selection;

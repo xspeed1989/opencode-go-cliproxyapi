@@ -28,7 +28,7 @@ This plugin exposes OpenCode Go as a single provider (`opencode-go`) backed by a
   - OpenAI Chat Completions (`/v1/chat/completions`)
   - Anthropic Messages (`/v1/messages`)
   - OpenAI Responses (`/v1/responses`)
-- **Thinking & Reasoning Support**: Maps reasoning effort across supported client and upstream formats.
+- **Reasoning Effort Pass-through**: Forwards explicit effort values unchanged, without local capability checks, normalization, or downgrade. The upstream owns validation.
 - **Dynamic Catalog Discovery**: Fetches remote model catalogs with local fallback and custom route overrides.
 - **Multi-Key Auth Scheduling**: Pools multiple API keys with CLIProxyAPI's native scheduler for rotation, retries, and error cooldowns across all protocols.
 - **OpenCode Go Quota Page**: Management Center includes a separate `OpenCode Go Quota` page. Page load lists credentials without contacting OpenCode; each card is refreshed manually and independently, and quota values do not affect routing or CPA's native quota page.
@@ -58,6 +58,20 @@ go build -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-cliproxyapi.dyl
 ```
 
 Place the compiled binary into your CLIProxyAPI plugin directory (e.g. `<cliproxyapi_root>/plugins/<os>/<arch>/`).
+
+## Reasoning effort pass-through
+
+Explicit reasoning levels are opaque upstream values. The plugin does not maintain an allowlist, change their case or whitespace, clamp them to catalog levels, or substitute another level. This applies to streaming and non-streaming requests.
+
+| Upstream protocol | Field receiving the unchanged client value |
+|---|---|
+| Chat Completions | `reasoning_effort` |
+| Responses | `reasoning.effort` |
+| Anthropic Messages | `output_config.effort` |
+
+Native requests retain their effort field. Cross-protocol requests only translate the field name; explicit Anthropic `output_config.effort` takes precedence over a numeric thinking budget. When a client supplies only an Anthropic budget and the upstream requires a level, the existing fixed threshold conversion is used without capability clamping. An explicit effort is never converted into a guessed budget, nor does it change sampling settings or output limits.
+
+Catalog reasoning metadata is exposed for clients but is not used as a request allowlist. The upstream can still reject or ignore a value; HTTP success alone does not prove that a requested effort was honored.
 
 ## Configuration
 

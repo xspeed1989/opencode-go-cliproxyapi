@@ -90,16 +90,27 @@ type HostClient interface {
 // including protocol/endpoint fields the catalog does not provide and
 // reasoning/tool_calling flags the plugin does not act on — are ignored via
 // json tags. Modality metadata accepts both spellings.
+//
+// Reasoning capability arrives in one of two shapes: the host-specific
+// `thinking` object and/or a `supported_reasoning_levels` list. Both are
+// decoded because catalogs publish them independently.
 type rawModel struct {
-	ID               string       `json:"id"`
-	DisplayName      string       `json:"display_name"`
-	ContextLength    int64        `json:"context_length"`
-	MaxOutputTokens  int64        `json:"max_output_tokens"`
-	InputModes       []string     `json:"input_modes"`
-	OutputModes      []string     `json:"output_modes"`
-	InputModalities  []string     `json:"input_modalities"`
-	OutputModalities []string     `json:"output_modalities"`
-	Thinking         *rawThinking `json:"thinking"`
+	ID               string              `json:"id"`
+	DisplayName      string              `json:"display_name"`
+	ContextLength    int64               `json:"context_length"`
+	MaxOutputTokens  int64               `json:"max_output_tokens"`
+	InputModes       []string            `json:"input_modes"`
+	OutputModes      []string            `json:"output_modes"`
+	InputModalities  []string            `json:"input_modalities"`
+	OutputModalities []string            `json:"output_modalities"`
+	Thinking         *rawThinking        `json:"thinking"`
+	ReasoningLevels  []rawReasoningLevel `json:"supported_reasoning_levels"`
+}
+
+// rawReasoningLevel is one entry of the catalog's declared reasoning-level
+// list; only the effort name identifies a usable level.
+type rawReasoningLevel struct {
+	Effort string `json:"effort"`
 }
 
 // rawThinking tolerantly decodes the optional per-model thinking object;
@@ -313,7 +324,7 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 			OutputLimit:  e.MaxOutputTokens,
 			InputModes:   inputModes,
 			OutputModes:  outputModes,
-			Thinking:     normalizeThinking(e.Thinking),
+			Thinking:     normalizeThinking(e.Thinking, e.ReasoningLevels),
 		}
 		// With a prefix enabled, one record's PublicID can equal another
 		// record's UpstreamID (upstream "foo" and "opencode-go/foo" both
@@ -411,29 +422,59 @@ func firstNonEmpty(a, b []string) []string {
 	return b
 }
 
-// normalizeThinking converts the decoded raw thinking object into its
-// pluginapi form; absent objects yield nil, partial ones a partial struct.
-func normalizeThinking(rt *rawThinking) *pluginapi.ThinkingSupport {
-	if rt == nil {
+// normalizeThinking exposes the catalog's declared reasoning metadata in
+// pluginapi form. Merge the two catalog shapes without inferring levels;
+// this metadata is informational and never gates request effort values.
+func normalizeThinking(rt *rawThinking, declared []rawReasoningLevel) *pluginapi.ThinkingSupport {
+	if rt == nil && len(declared) == 0 {
 		return nil
 	}
 	t := &pluginapi.ThinkingSupport{}
-	if rt.Min != nil {
-		t.Min = *rt.Min
+	var declaredLevels []string
+	if rt != nil {
+		if rt.Min != nil {
+			t.Min = *rt.Min
+		}
+		if rt.Max != nil {
+			t.Max = *rt.Max
+		}
+		if rt.ZeroAllowed != nil {
+			t.ZeroAllowed = *rt.ZeroAllowed
+		}
+		if rt.DynamicAllowed != nil {
+			t.DynamicAllowed = *rt.DynamicAllowed
+		}
+		declaredLevels = rt.Levels
 	}
-	if rt.Max != nil {
-		t.Max = *rt.Max
+	var listLevels []string
+	for _, level := range declared {
+		listLevels = append(listLevels, level.Effort)
 	}
-	if rt.ZeroAllowed != nil {
-		t.ZeroAllowed = *rt.ZeroAllowed
-	}
-	if rt.DynamicAllowed != nil {
-		t.DynamicAllowed = *rt.DynamicAllowed
-	}
-	if len(rt.Levels) > 0 {
-		t.Levels = append([]string(nil), rt.Levels...)
-	}
+	t.Levels = mergeLevels(declaredLevels, listLevels)
 	return t
+}
+
+// mergeLevels concatenates level groups, trimming blanks and dropping
+// case-insensitive duplicates; the first spelling of a level wins so an
+// explicit `thinking.levels` entry keeps its casing.
+func mergeLevels(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, group := range groups {
+		for _, raw := range group {
+			level := strings.TrimSpace(raw)
+			if level == "" {
+				continue
+			}
+			key := strings.ToLower(level)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, level)
+		}
+	}
+	return out
 }
 
 // Models returns the routable snapshot (FR-003 identity fields). The slice
