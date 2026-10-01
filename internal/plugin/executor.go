@@ -158,6 +158,41 @@ func upstreamAuthHeaders(route catalog.Route, key, sessionID string) http.Header
 
 const emptyOpenCodeSessionID = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+// streamErrorBodyLimit bounds how much of a refused streaming response is read
+// for the classified message; UpstreamStatusError redacts and truncates the
+// snippet further.
+const streamErrorBodyLimit = 8 << 10
+
+// streamErrorReadAttempts bounds the host calls made for one refused stream, so
+// a host that keeps answering with empty non-terminal chunks cannot wedge the
+// error path.
+const streamErrorReadAttempts = 8
+
+// readStreamErrorBody drains a bounded prefix of an upstream response whose open
+// already failed, so the envelope can state the upstream's reason instead of an
+// empty message. Reads are best-effort: the first error, upstream error label,
+// empty chunk, or end of body stops collection and returns what was gathered.
+func readStreamErrorBody(bridge *HostBridge, upstreamStreamID string) []byte {
+	if bridge == nil || upstreamStreamID == "" {
+		return nil
+	}
+	var body []byte
+	for attempt := 0; attempt < streamErrorReadAttempts && len(body) < streamErrorBodyLimit; attempt++ {
+		payload, errMsg, done, err := bridge.StreamRead(upstreamStreamID)
+		if err != nil || errMsg != "" || len(payload) == 0 {
+			break
+		}
+		body = append(body, payload...)
+		if done {
+			break
+		}
+	}
+	if len(body) > streamErrorBodyLimit {
+		body = body[:streamErrorBodyLimit]
+	}
+	return body
+}
+
 // resolveOpenCodeSessionID applies the FR-012/AC-H precedence: CPA's canonical
 // identity, an explicit inbound session header, then the existing content hash.
 func resolveOpenCodeSessionID(req executorRequest) (string, *errclass.Error) {
@@ -381,8 +416,13 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		return classEnvelope(errclass.FromNetwork(err)), nil
 	}
 	if st >= 400 {
+		// The upstream's reason lives in the response body. Read a bounded
+		// prefix before closing so the classified error names it: the host
+		// renders an empty message as its generic "plugin call failed",
+		// which hides both the status and the reason from the operator.
+		body := readStreamErrorBody(m.bridge, id)
 		_ = m.bridge.StreamClose(id)
-		return classEnvelope(errclass.FromStatus(st, "")), nil
+		return classEnvelope(shared.UpstreamStatusError(st, body)), nil
 	}
 
 	downID := req.StreamID

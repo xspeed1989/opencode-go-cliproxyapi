@@ -2,6 +2,8 @@ package errclass
 
 import (
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -76,8 +78,59 @@ func TestFromNetwork(t *testing.T) {
 		t.Errorf("FromNetwork(err) = %+v", e)
 	}
 	nilErr := FromNetwork(nil)
-	if nilErr.Message != "" || !nilErr.Retryable {
+	// A nil cause still yields a message: the host renders an empty one as its
+	// generic "plugin call failed" placeholder, which hides the class.
+	if nilErr.Message == "" || !nilErr.Retryable {
 		t.Errorf("FromNetwork(nil) = %+v", nilErr)
+	}
+}
+
+// Regression: every classified error must carry a message. The host replaces an
+// empty message with "plugin call failed", hiding both the class and the
+// upstream cause from the operator.
+func TestClassifiedErrorsAlwaysCarryAMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		err  *Error
+		want string // substring the fallback must name
+	}{
+		{"status without a message", FromStatus(http.StatusBadRequest, ""), "400"},
+		{"upstream status without a message", FromStatus(http.StatusBadGateway, ""), "upstream_server_failure"},
+		{"network without a cause", FromNetwork(nil), "timeout_or_network_failure"},
+		{"post-first-byte without a message", PostFirstByteNetwork(""), "timeout_or_network_failure"},
+		{"translation without a message", Translation(""), "translation_failure"},
+		{"upstream fallback without a message", UpstreamFallback(""), "upstream_server_failure"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if strings.TrimSpace(tc.err.Message) == "" {
+				t.Fatalf("message is empty: %+v", tc.err)
+			}
+			if !strings.Contains(tc.err.Message, tc.want) {
+				t.Fatalf("message %q does not name the failure (%q)", tc.err.Message, tc.want)
+			}
+			wire := ToEnvelopeError(tc.err)
+			if strings.TrimSpace(wire.Message) == "" || wire.Message == "plugin call failed" {
+				t.Fatalf("envelope message = %q", wire.Message)
+			}
+		})
+	}
+	// A real reason is never replaced by the fallback.
+	if got := FromStatus(http.StatusBadRequest, "upstream says no").Message; got != "upstream says no" {
+		t.Fatalf("real message replaced: %q", got)
+	}
+}
+
+// Errors built as struct literals bypass the constructors; the envelope edge
+// still substitutes a fallback so the host never prints its generic
+// "plugin call failed" placeholder in place of the failure class.
+func TestEnvelopeFillsAnEmptyLiteralMessage(t *testing.T) {
+	wire := ToEnvelopeError(&Error{Class: ClassQuota, StatusCode: http.StatusTooManyRequests})
+	if strings.TrimSpace(wire.Message) == "" || wire.Message == "plugin call failed" {
+		t.Fatalf("envelope message = %q", wire.Message)
+	}
+	if !strings.Contains(wire.Message, "quota_exhaustion") || !strings.Contains(wire.Message, "429") {
+		t.Fatalf("fallback must name class and status: %q", wire.Message)
 	}
 }
 

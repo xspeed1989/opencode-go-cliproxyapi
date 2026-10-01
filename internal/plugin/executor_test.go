@@ -782,6 +782,73 @@ func TestExecuteStream4xxClosesUpstreamEntry(t *testing.T) {
 	}
 }
 
+func TestExecuteStream4xxCarriesTheUpstreamReason(t *testing.T) {
+	// The refusal body is the only place the upstream states its reason; the
+	// classified error must name it instead of carrying an empty message, which
+	// the host renders as its generic "plugin call failed".
+	m, f := newStreamManager(t, streamScript{
+		startStatus: http.StatusBadRequest,
+		upstreamID:  "up-4xx-body",
+		frames:      []string{`{"error":{"message":"input exceeds the context window of this model"}}`},
+	})
+	env := decodeEnv(t, mustHandle(t, m, "executor.execute_stream",
+		execStreamReqBody("opencode-go/glm-5.3", "openai", []byte(ccRequestBody), "down-4xx")))
+	if env.OK || env.Error == nil {
+		t.Fatalf("envelope = %+v", env.Error)
+	}
+	if env.Error.HTTPStatus != http.StatusBadRequest || env.Error.Code != "unsupported_protocol_or_parameter" {
+		t.Fatalf("classification = %s/%d", env.Error.Code, env.Error.HTTPStatus)
+	}
+	if !strings.Contains(env.Error.Message, "input exceeds the context window") {
+		t.Fatalf("upstream reason lost: %q", env.Error.Message)
+	}
+	if env.Error.Message == "plugin call failed" {
+		t.Fatal("host placeholder leaked into the classified error")
+	}
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamClose)); got != 1 {
+		t.Fatalf("upstream closes = %d, want 1", got)
+	}
+}
+
+func TestExecuteStream4xxWithoutBodyStillDescribesTheFailure(t *testing.T) {
+	// Some upstreams refuse with an empty body. The message must still be
+	// non-empty and name the status, and reading must stay bounded.
+	m, f := newStreamManager(t, streamScript{startStatus: http.StatusBadRequest, upstreamID: "up-4xx-empty"})
+	env := decodeEnv(t, mustHandle(t, m, "executor.execute_stream",
+		execStreamReqBody("opencode-go/glm-5.3", "openai", []byte(ccRequestBody), "down-4xx-empty")))
+	if env.OK || env.Error == nil {
+		t.Fatalf("envelope = %+v", env.Error)
+	}
+	if !strings.Contains(env.Error.Message, "400") {
+		t.Fatalf("message must name the status: %q", env.Error.Message)
+	}
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamRead)); got != 1 {
+		t.Fatalf("empty-body reads = %d, want 1 (bounded)", got)
+	}
+	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamClose)); got != 1 {
+		t.Fatalf("upstream closes = %d, want 1", got)
+	}
+}
+
+func TestExecuteStream4xxBodySnippetIsBounded(t *testing.T) {
+	// The snippet is capped in the plugin and again by the envelope, so a huge
+	// upstream error body can never be echoed back in full.
+	huge := strings.Repeat("y", 64<<10)
+	m, _ := newStreamManager(t, streamScript{
+		startStatus: http.StatusBadGateway,
+		upstreamID:  "up-4xx-huge",
+		frames:      []string{huge},
+	})
+	env := decodeEnv(t, mustHandle(t, m, "executor.execute_stream",
+		execStreamReqBody("opencode-go/glm-5.3", "openai", []byte(ccRequestBody), "down-4xx-huge")))
+	if env.OK || env.Error == nil {
+		t.Fatalf("envelope = %+v", env.Error)
+	}
+	if len(env.Error.Message) > 200 {
+		t.Fatalf("message not bounded: %d chars", len(env.Error.Message))
+	}
+}
+
 func TestExecuteStreamOpenTransportError(t *testing.T) {
 	// Pre-first-byte network failure produces no downstream bytes and no stream
 	// lifecycle to clean up.

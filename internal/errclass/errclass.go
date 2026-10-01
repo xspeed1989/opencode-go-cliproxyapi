@@ -3,6 +3,7 @@
 package errclass
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -54,20 +55,20 @@ func FromStatus(status int, message string) *Error {
 	}
 	switch status {
 	case 401:
-		return &Error{Class: ClassAuth, Message: msg, StatusCode: status, Retryable: true}
+		return ensureMessage(&Error{Class: ClassAuth, Message: msg, StatusCode: status, Retryable: true})
 	case 403:
-		return &Error{Class: quotaClass(ClassAuth), Message: msg, StatusCode: status, Retryable: true}
+		return ensureMessage(&Error{Class: quotaClass(ClassAuth), Message: msg, StatusCode: status, Retryable: true})
 	case 402:
-		return &Error{Class: quotaClass(ClassBilling), Message: msg, StatusCode: status, Retryable: true}
+		return ensureMessage(&Error{Class: quotaClass(ClassBilling), Message: msg, StatusCode: status, Retryable: true})
 	case 404:
-		return &Error{Class: ClassInvalidModel, Message: msg, StatusCode: status}
+		return ensureMessage(&Error{Class: ClassInvalidModel, Message: msg, StatusCode: status})
 	case 429:
-		return &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true}
+		return ensureMessage(&Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true})
 	}
 	if status >= 500 {
-		return &Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true}
+		return ensureMessage(&Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true})
 	}
-	return &Error{Class: ClassUnsupported, Message: msg, StatusCode: status}
+	return ensureMessage(&Error{Class: ClassUnsupported, Message: msg, StatusCode: status})
 }
 
 // FromNetwork classifies a PRE-first-byte network/timeout failure; always
@@ -78,7 +79,7 @@ func FromNetwork(err error) *Error {
 	if err != nil {
 		msg = Redact(err.Error())
 	}
-	return &Error{Class: ClassNetwork, Message: msg, Retryable: true}
+	return ensureMessage(&Error{Class: ClassNetwork, Message: msg, Retryable: true})
 }
 
 // PostFirstByteNetwork classifies a network/timeout failure seen AFTER the
@@ -86,12 +87,12 @@ func FromNetwork(err error) *Error {
 // delivered downstream, so a retry would risk duplicate delivery of a half
 // stream — never retryable (§7).
 func PostFirstByteNetwork(msg string) *Error {
-	return &Error{Class: ClassNetwork, Message: Redact(msg), Retryable: false}
+	return ensureMessage(&Error{Class: ClassNetwork, Message: Redact(msg), Retryable: false})
 }
 
 // Translation reports an FR-005/FR-006 translation failure; never retryable.
 func Translation(msg string) *Error {
-	return &Error{Class: ClassTranslation, Message: Redact(msg)}
+	return ensureMessage(&Error{Class: ClassTranslation, Message: Redact(msg)})
 }
 
 // UpstreamFallback builds a ClassUpstream error for the adapter fallback
@@ -99,7 +100,32 @@ func Translation(msg string) *Error {
 // §7 makes upstream server failures retryable; the message is redacted at
 // construction.
 func UpstreamFallback(msg string) *Error {
-	return &Error{Class: ClassUpstream, Message: Redact(msg), Retryable: true}
+	return ensureMessage(&Error{Class: ClassUpstream, Message: Redact(msg), Retryable: true})
+}
+
+// ensureMessage keeps a classified error self-describing. An empty message
+// surfaces to the operator as the host's generic "plugin call failed"
+// placeholder (and as a blank reason in logs), hiding both the failure class
+// and the upstream cause, so a class-derived fallback is substituted instead.
+func ensureMessage(e *Error) *Error {
+	if strings.TrimSpace(e.Message) == "" {
+		e.Message = fallbackMessage(e)
+	}
+	return e
+}
+
+// fallbackMessage names the failure class (and the upstream status when one is
+// known) for errors that carry no detail of their own, e.g. an upstream that
+// refused a request with an empty body.
+func fallbackMessage(e *Error) string {
+	class := string(e.Class)
+	if class == "" {
+		class = "unclassified"
+	}
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("upstream returned HTTP %d (%s) without a message", e.StatusCode, class)
+	}
+	return fmt.Sprintf("%s without a message", class)
 }
 
 // ToEnvelopeError converts to the shared SDK wire type with a redacted
@@ -114,9 +140,15 @@ func ToEnvelopeError(e *Error) pluginabi.Error {
 			status = 400
 		}
 	}
+	message := Redact(e.Message)
+	if strings.TrimSpace(message) == "" {
+		// Defense in depth for errors built outside the constructors: the
+		// host substitutes its generic placeholder for an empty message.
+		message = fallbackMessage(e)
+	}
 	return pluginabi.Error{
 		Code:       string(e.Class),
-		Message:    Redact(e.Message),
+		Message:    message,
 		Retryable:  e.Retryable,
 		HTTPStatus: status,
 	}

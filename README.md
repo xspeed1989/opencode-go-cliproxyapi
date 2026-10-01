@@ -29,6 +29,7 @@ This plugin exposes OpenCode Go as a single provider (`opencode-go`) backed by a
   - Anthropic Messages (`/v1/messages`)
   - OpenAI Responses (`/v1/responses`)
 - **Reasoning Effort Pass-through**: Forwards explicit effort values unchanged, without local capability checks, normalization, or downgrade. The upstream owns validation.
+- **Explainable failures**: a streaming request the upstream refuses before the first byte reports that status plus a bounded, redacted snippet of its error body, instead of an empty message the host renders as `plugin call failed`.
 - **Dynamic Catalog Discovery**: Fetches remote model catalogs with local fallback and custom route overrides.
 - **Multi-Key Auth Scheduling**: Pools multiple API keys with CLIProxyAPI's native scheduler for rotation, retries, and error cooldowns across all protocols.
 - **OpenCode Go Quota Page**: Management Center includes a separate `OpenCode Go Quota` page. Page load lists credentials without contacting OpenCode; each card is refreshed manually and independently, and quota values do not affect routing or CPA's native quota page.
