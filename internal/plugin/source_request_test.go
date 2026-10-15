@@ -51,39 +51,57 @@ func TestExecutorPreparationSharesOneSourceRequest(t *testing.T) {
 }
 
 // TestExecutorNativePassthroughWithSessionIdentitySkipsTypedDecode is the
-// passthrough guard: a native Responses body carrying an input shape the typed
+// passthrough guard: a native Responses body carrying a shape the typed
 // conversion cannot model round-trips byte-exact when session identity is
 // supplied, and still fails with the same translation error when the fallback
 // content digest has to decode it. That is only true if the native branch uses
 // the raw body and the metadata/header short-circuit keeps the typed decode
 // off the request path.
+//
+// Both lazy decodes are covered, not only the input-item one: an input-item
+// failure still parses as a typed envelope (Input is json.RawMessage), so a
+// native path that accidentally decoded the envelope would slip past the first
+// case. The second case defeats the envelope decode itself.
 func TestExecutorNativePassthroughWithSessionIdentitySkipsTypedDecode(t *testing.T) {
-	body := []byte(`{"model":"gpt-5.6-luna","input":["raw-string-entry"]}`)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"input-items-undecodable", `{"model":"gpt-5.6-luna","input":["raw-string-entry"]}`},
+		// max_output_tokens is typed *int64, so the typed envelope cannot
+		// decode a string here while native passthrough forwards it verbatim.
+		{"envelope-undecodable", `{"model":"gpt-5.6-luna","max_output_tokens":"opaque","input":[]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(tc.body)
 
-	m, f := newExecManager(t)
-	resp, err := m.HandleCall("executor.execute",
-		execReqBodyWithSessionInputs("gpt-5.6-luna", "openai-response", body, false, testKey, "canonical-native", ""))
-	if err != nil {
-		t.Fatalf("execute: %v", err)
-	}
-	if env := decodeEnv(t, resp); !env.OK {
-		t.Fatalf("passthrough with identity failed: %+v", env.Error)
-	}
-	wire := lastWire(t, f, pluginabi.MethodHostHTTPDo)
-	if got := wireBody(t, wire, "body"); !bytes.Equal(got, body) {
-		t.Fatalf("native body not preserved:\n got: %s\nwant: %s", got, body)
-	}
-	assertSessionHeaders(t, wire, "canonical-native", "Bearer "+testKey)
+			m, f := newExecManager(t)
+			resp, err := m.HandleCall("executor.execute",
+				execReqBodyWithSessionInputs("gpt-5.6-luna", "openai-response", body, false, testKey, "canonical-native", ""))
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if env := decodeEnv(t, resp); !env.OK {
+				t.Fatalf("passthrough with identity failed: %+v", env.Error)
+			}
+			wire := lastWire(t, f, pluginabi.MethodHostHTTPDo)
+			if got := wireBody(t, wire, "body"); !bytes.Equal(got, body) {
+				t.Fatalf("native body not preserved:\n got: %s\nwant: %s", got, body)
+			}
+			assertSessionHeaders(t, wire, "canonical-native", "Bearer "+testKey)
 
-	m2, _ := newExecManager(t)
-	resp2, err := m2.HandleCall("executor.execute",
-		execReqBodyWithSessionInputs("gpt-5.6-luna", "openai-response", body, false, testKey, "", ""))
-	if err != nil {
-		t.Fatalf("execute without identity: %v", err)
-	}
-	env2 := decodeEnv(t, resp2)
-	if env2.OK || env2.Error == nil || env2.Error.Code != string(errclass.ClassTranslation) {
-		t.Fatalf("untyped input without identity must stay a translation failure: %+v", env2.Error)
+			m2, _ := newExecManager(t)
+			resp2, err := m2.HandleCall("executor.execute",
+				execReqBodyWithSessionInputs("gpt-5.6-luna", "openai-response", body, false, testKey, "", ""))
+			if err != nil {
+				t.Fatalf("execute without identity: %v", err)
+			}
+			env2 := decodeEnv(t, resp2)
+			if env2.OK || env2.Error == nil || env2.Error.Code != string(errclass.ClassTranslation) {
+				t.Fatalf("untyped input without identity must stay a translation failure: %+v", env2.Error)
+			}
+		})
 	}
 }
 

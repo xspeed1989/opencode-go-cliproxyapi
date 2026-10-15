@@ -291,7 +291,7 @@ func BenchmarkFullExecutor(b *testing.B) {
 func newBenchManager(b *testing.B) (*Manager, error) {
 	b.Helper()
 	const catalogJSON = `{"data":[{"id":"deepseek-v4-pro"}]}`
-	f := &fakeCaller{}
+	f := &fakeCaller{noRecordPayloads: true}
 	m := NewManager(NewHostBridge(f.call))
 	b.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
 	f.responder = wrapWithCatalog(catalogJSON, func(method string, payload []byte) ([]byte, error) {
